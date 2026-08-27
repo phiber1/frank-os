@@ -14,6 +14,7 @@
 #include "snd.h"
 #include "audio.h"
 #include "board_config.h"
+#include "tlv320dac3100.h"
 
 #include <string.h>
 #include <stdbool.h>
@@ -164,13 +165,23 @@ void snd_init(void) {
     snd_i2s_config.channel_count  = 2;
     snd_i2s_config.data_pin       = I2S_DATA_PIN;
     snd_i2s_config.clock_pin_base = I2S_CLOCK_PIN_BASE;
+#ifdef FRANK_BOARD_FRUITJAM
+    /* Fruit Jam: PIO0/PIO1 belong exclusively to PIO-USB (it assumes sole
+     * ownership of its PIOs); audio shares PIO2 with the netcard UART. */
+    snd_i2s_config.pio            = pio2;
+#else
     snd_i2s_config.pio            = pio1;
+#endif
     snd_i2s_config.dma_trans_count = SND_DMA_FRAMES;
     snd_i2s_config.volume         = 0;
 
     i2s_init(&snd_i2s_config);
     i2s_set_fill_callback(snd_fill_dma);
     i2s_start();
+
+    /* Fruit Jam: the TLV320DAC3100 codec derives its clocks from the now-
+     * running BCLK and must be configured over I2C (no-op on other boards) */
+    tlv320dac3100_init();
 }
 
 /*==========================================================================
