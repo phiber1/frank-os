@@ -12,6 +12,18 @@
 #include "usbhid.h"
 #include <string.h>
 
+#if CFG_TUH_RPI_PIO_USB
+/* Fruit Jam: USB-A host jacks are on PIO-USB, not the native controller */
+#include <stdio.h>
+#include "pico/stdlib.h"
+#include "board_config.h"
+#include "pio_usb.h"
+#include "pio_usb_ll.h"
+#include "hardware/gpio.h"
+#include "hardware/dma.h"
+#include "hardware/pio.h"
+#endif
+
 #if CFG_TUH_ENABLED
 
 #define MAX_REPORT 4
@@ -145,6 +157,11 @@ void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance,
                        uint8_t const *desc_report, uint16_t desc_len) {
     uint8_t const itf_protocol = tuh_hid_interface_protocol(dev_addr, instance);
 
+    printf("[USB] HID mounted: addr=%d itf=%d proto=%d (%s)\n",
+           dev_addr, instance, itf_protocol,
+           itf_protocol == HID_ITF_PROTOCOL_KEYBOARD ? "keyboard" :
+           itf_protocol == HID_ITF_PROTOCOL_MOUSE    ? "mouse" : "other");
+
     if (itf_protocol == HID_ITF_PROTOCOL_KEYBOARD)
         keyboard_connected = 1;
     else if (itf_protocol == HID_ITF_PROTOCOL_MOUSE)
@@ -188,7 +205,62 @@ void tuh_hid_report_received_cb(uint8_t dev_addr, uint8_t instance,
 }
 
 void usbhid_init(void) {
+#if CFG_TUH_RPI_PIO_USB
+    /* Power the USB-A jacks (5V rail enable) */
+    gpio_init(USB_HOST_5V_PIN);
+    gpio_put(USB_HOST_5V_PIN, 1);
+    gpio_set_dir(USB_HOST_5V_PIN, GPIO_OUT);
+
+    /* Pico-PIO-USB gets PIO0 and PIO1 EXCLUSIVELY, in its default
+     * configuration (tx=PIO0/SM0, rx=PIO1/SM0, eop=PIO1/SM1). Sharing
+     * PIOs with it does not work: it force-loads TX at offset 0 and
+     * rewrites it every SOF frame, and TX+RX programs total 47
+     * instructions — more than one 32-slot PIO holds. FRANKOS
+     * peripherals live on PIO2 (I2S audio + netcard UART); PS/2 is not
+     * initialized on this board. NOTE these values are also baked as
+     * PIO_USB_*_DEFAULT compile defines (drivers/usbhid/CMakeLists.txt)
+     * because stdio_init_all()'s tusb_init() starts the host with the
+     * default config before this tuh_configure can run. */
+    static pio_usb_configuration_t pio_cfg = PIO_USB_DEFAULT_CONFIG;
+    pio_cfg.pin_dp     = USB_HOST_DP_PIN;   /* D+ = GPIO 1, D- = D+ + 1 */
+    pio_cfg.pio_tx_num = 0;
+    pio_cfg.sm_tx      = 0;
+    pio_cfg.pio_rx_num = 1;
+    pio_cfg.sm_rx      = 0;
+    pio_cfg.sm_eop     = 1;
+    /* pio_usb claims the channel itself (dma_claim_mask) — find a free
+     * one, then unclaim so its claim doesn't double-claim and assert. */
+    pio_cfg.tx_ch      = dma_claim_unused_channel(true);
+    dma_channel_unclaim(pio_cfg.tx_ch);
+    tuh_configure(BOARD_TUH_RHPORT, TUH_CFGID_RPI_PIO_USB_CONFIGURATION,
+                  &pio_cfg);
+#endif
     tuh_init(BOARD_TUH_RHPORT);
+
+#if CFG_TUH_RPI_PIO_USB
+    /* stdio_init_all()'s tusb_init() started the PIO-USB host early in
+     * boot and computed its bit-rate dividers from the clock at that
+     * moment — but DispHSTX re-clocks the system to the video rate
+     * during display init, leaving those dividers stale (TX off the USB
+     * bit rate, undecodable by any device). Recompute them against the
+     * final clock; pio_usb re-applies them to the SMs on every attach. */
+    {
+        extern pio_port_t pio_port[1];
+        pio_port_t *pp = &pio_port[0];
+        float cpu = (float)clock_get_hz(clk_sys);
+        #define FRANK_SET_DIV(field, hz) do {                          \
+            float _d = cpu / (float)(hz);                              \
+            pp->field.div_int  = (uint16_t)_d;                         \
+            pp->field.div_frac = (uint8_t)((_d - (uint16_t)_d) * 256); \
+        } while (0)
+        FRANK_SET_DIV(clk_div_fs_tx, 48000000);
+        FRANK_SET_DIV(clk_div_ls_tx, 6000000);
+        FRANK_SET_DIV(clk_div_fs_rx, 96000000);
+        FRANK_SET_DIV(clk_div_ls_rx, 12000000);
+        #undef FRANK_SET_DIV
+    }
+#endif
+
     memset(&prev_kbd_report, 0, sizeof(prev_kbd_report));
     cumulative_dx = 0;
     cumulative_dy = 0;
@@ -198,6 +270,18 @@ void usbhid_init(void) {
     key_action_head = 0;
     key_action_tail = 0;
 }
+
+#if CFG_TUH_RPI_PIO_USB
+/* Power-cycle the hub to force a fresh attach and clean enumeration.
+ * Call only once the system is fully booted and quiet. */
+void usbhid_start_enumeration(void) {
+    printf("[USB] boot settled — power-cycling hub for enumeration\n");
+    stdio_flush();
+    gpio_put(USB_HOST_5V_PIN, 0);
+    sleep_ms(300);
+    gpio_put(USB_HOST_5V_PIN, 1);
+}
+#endif
 
 void usbhid_task(void) {
     tuh_task();
