@@ -213,6 +213,32 @@ static void *app_task;
 static volatile bool app_closing;
 
 /*==========================================================================
+ * Playback priority boost
+ *
+ * Decoding runs on the app task, which the loader creates at priority 1 —
+ * below the compositor (2) and input (3).  Mouse movement keeps both
+ * higher-priority tasks busy (hit-testing, cursor overlay, repaints) and
+ * starves the decoder past the OS mixer's ~46ms ring: audible dropouts.
+ * Boost to input priority while actually playing; pcm_write()'s ring
+ * back-pressure blocks us most of the time, so the UI stays responsive
+ * (same scheme as MMBasic's audio pump).  Always pass the app task
+ * HANDLE: transport toggles can run on the WM task, and boosting that
+ * by accident (NULL = current task) would be a fresh bug.
+ *=========================================================================*/
+/* Playback boost is EQUAL to the compositor (2), not above it: at 3 the
+ * decode bursts preempted the compositor mid-repaint and the window's
+ * cleared-but-not-yet-drawn state hit the scanout (visible flicker).
+ * Equal priority time-slices per tick: decode still gets ~half the core
+ * (it needs ~a third), paints are only interrupted in 2ms slivers. */
+#define FA_PRIO_PLAYBACK 2
+#define FA_PRIO_NORMAL   1
+static void fa_playback_prio(int on) {
+    typedef void (*fn_t)(void *, uint32_t);
+    ((fn_t)_sys_table_ptrs[11])(app_task, on ? FA_PRIO_PLAYBACK
+                                             : FA_PRIO_NORMAL);
+}
+
+/*==========================================================================
  * 7-segment bitmasks
  *=========================================================================*/
 
@@ -374,7 +400,7 @@ static audio_format_t detect_format(const char *path) {
  * MOD decoding
  *=========================================================================*/
 
-#define MOD_CHUNK_FRAMES  1024  /* ~23ms at 44100 Hz */
+#define MOD_CHUNK_FRAMES  1024  /* ~46ms at the 22050 Hz render rate */
 
 static int decode_frame_mod(frankamp_t *fa) {
     hxcmod_fillbuffer(&fa->mod_ctx, (msample *)fa->pcm_buf,
@@ -427,6 +453,7 @@ static void play_stop(frankamp_t *fa) {
         return;
 
     fa->play_state = PS_STOPPED;
+    fa_playback_prio(0);
 
     if (fa->audio_active) {
         pcm_cleanup();
@@ -493,6 +520,7 @@ static bool play_start(frankamp_t *fa, int playlist_idx) {
         pcm_init(44100, 2);
         fa->audio_active = true;
         fa->play_state = PS_PLAYING;
+        fa_playback_prio(1);
 
         /* Decode and write first chunk to kick off DMA */
         int nf = decode_frame_midi(fa);
@@ -531,7 +559,13 @@ static bool play_start(frankamp_t *fa, int playlist_idx) {
         }
 
         hxcmod_init(&fa->mod_ctx);
-        hxcmod_setcfg(&fa->mod_ctx, 44100, 1, 1);
+        /* Render at 22050Hz: hxcmod costs ~12ms CPU per 1024 frames
+         * regardless of rate (52%% duty at 44100 - it LOST the race
+         * against real time whenever the mouse moved).  At 22050 the
+         * same work buys twice the audio (26%% duty) and the OS mixer
+         * ring holds twice the wall time; the mixer resamples to
+         * 44100.  Amiga-era 8-bit samples don't miss the octave. */
+        hxcmod_setcfg(&fa->mod_ctx, 22050, 1, 1);
         if (!hxcmod_load(&fa->mod_ctx, fa->mod_data, (int)fa->mod_data_size)) {
             dbg_printf("[frankamp] hxcmod_load failed\n");
             free(fa->mod_data);
@@ -539,21 +573,22 @@ static bool play_start(frankamp_t *fa, int playlist_idx) {
             return false;
         }
 
-        fa->info.samprate = 44100;
+        fa->info.samprate = 22050;
         fa->info.nChans = 2;
         fa->info.bitrate = 0;
         fa->total_ms = 0;  /* MOD loops — no fixed duration */
         fa->elapsed_ms = 0;
 
-        pcm_init(44100, 2);
+        pcm_init(22050, 2);
         fa->audio_active = true;
         fa->play_state = PS_PLAYING;
+        fa_playback_prio(1);
 
         /* Decode and write first chunk to kick off DMA */
         int nf = decode_frame_mod(fa);
         pcm_write(fa->pcm_buf, nf);
 
-        dbg_printf("[frankamp] playing MOD: %s (44100 Hz, stereo)\n", path);
+        dbg_printf("[frankamp] playing MOD: %s (22050 Hz, stereo)\n", path);
     } else {
         /* === MP3 playback === */
         FRESULT res = f_open(&fa->mp3_file, path, FA_READ | FA_OPEN_EXISTING);
@@ -591,6 +626,7 @@ static bool play_start(frankamp_t *fa, int playlist_idx) {
         pcm_init(sr, 2);
         fa->audio_active = true;
         fa->play_state = PS_PLAYING;
+        fa_playback_prio(1);
 
         pcm_write(fa->pcm_buf, nf);
 
@@ -602,10 +638,13 @@ static bool play_start(frankamp_t *fa, int playlist_idx) {
 }
 
 static void play_pause(frankamp_t *fa) {
-    if (fa->play_state == PS_PLAYING)
+    if (fa->play_state == PS_PLAYING) {
         fa->play_state = PS_PAUSED;
-    else if (fa->play_state == PS_PAUSED)
+        fa_playback_prio(0);
+    } else if (fa->play_state == PS_PAUSED) {
         fa->play_state = PS_PLAYING;
+        fa_playback_prio(1);
+    }
 }
 
 static void play_next(frankamp_t *fa) {
@@ -652,7 +691,7 @@ static bool audio_step(frankamp_t *fa) {
     if (fa->format == FMT_MOD) {
         int nf = decode_frame_mod(fa);
         pcm_write(fa->pcm_buf, nf);
-        fa->elapsed_ms += MOD_CHUNK_FRAMES * 1000 / 44100;
+        fa->elapsed_ms += MOD_CHUNK_FRAMES * 1000 / 22050;
         return true;  /* MOD loops forever */
     }
     int nf = decode_frame(fa);
@@ -1494,6 +1533,7 @@ static bool main_event(hwnd_t hwnd, const window_event_t *ev) {
             pcm_cleanup();
             fa->audio_active = false;
         }
+        fa_playback_prio(0);
 
         if (fa->ui_timer) {
             xTimerStop(fa->ui_timer, portMAX_DELAY);
