@@ -596,6 +596,9 @@ void MIPS16 cmd_drive(void)
         b[i] = mytoupper(p[i]);
     if (strcmp(b, "A:/FORMAT") == 0)
     {
+#ifdef _FRANKOS
+        error("A: drive not available - use B: (SD card)");
+#endif
         FatFSFileSystem = FatFSFileSystemSave = 0;
         chdir("A:/");
         ResetFlashStorage(1);
@@ -603,6 +606,9 @@ void MIPS16 cmd_drive(void)
     }
     if (strcmp(b, "A:") == 0)
     {
+#ifdef _FRANKOS
+        error("A: drive not available - use B: (SD card)");
+#endif
         FatFSFileSystem = FatFSFileSystemSave = 0;
         return;
     }
@@ -1973,7 +1979,10 @@ void fun_dir(void)
             *pp = '*';
         if (!(*path))
             *path = '/';
-        djd.pat = pp;
+#ifndef _FRANKOS
+        djd.pat = pp;   /* vestigial: this loop filters via pattern_matching();
+                           the OS DIR (FF_USE_FIND=0) has no pat member */
+#endif
         if (!InitSDCard())
             return; // setup the SD card
         if (FSsave == 1)
@@ -4442,6 +4451,12 @@ int InitSDCard(void)
 {
     if (!FatFSFileSystem)
         return 1;
+#ifdef _FRANKOS
+    /* The OS owns the SD card (mounted at boot, driven by the OS FatFS
+     * engine); there are no app-side SPI pins to validate. */
+    ErrorThrow(0, NONEFILE);
+    return 1;
+#else
     int i;
     ErrorThrow(0, NONEFILE); // reset mm.errno to zero
     if (((IsInvalidPin(Option.SD_CS) && !Option.CombinedCS) || (IsInvalidPin(Option.SYSTEM_MOSI) && IsInvalidPin(Option.SD_MOSI_PIN)) || (IsInvalidPin(Option.SYSTEM_MISO) && IsInvalidPin(Option.SD_MISO_PIN)) || (IsInvalidPin(Option.SYSTEM_CLK) && IsInvalidPin(Option.SD_CLK_PIN))))
@@ -4460,6 +4475,7 @@ int InitSDCard(void)
         return false;
     }
     return 2;
+#endif /* !_FRANKOS */
 }
 void getfullfilename(char *fname, char *q)
 {
@@ -4713,6 +4729,12 @@ int drivecheck(char *p, int *waste)
             return FatFSFileSystem + 1;
         if (*p == 'a' || *p == 'A')
         {
+#ifdef _FRANKOS
+            /* A: (flash filesystem) has no physical backing on Frank OS —
+             * the flash region is emulated in RAM and shared with program
+             * memory.  Only the B: (SD card) drive exists. */
+            error("A: drive not available - use B: (SD card)");
+#endif
             *waste = 2;
             return FLASHFILE;
         }
@@ -4731,6 +4753,9 @@ int drivecheck(char *p, int *waste)
             return FatFSFileSystem + 1;
         if (*p == 'a' || *p == 'A')
         {
+#ifdef _FRANKOS
+            error("A: drive not available - use B: (SD card)");
+#endif
             *waste = 2;
             return FLASHFILE;
         }
@@ -5687,12 +5712,19 @@ void MIPS16 cmd_files(void)
                     return;
                     //                        longjmp(mark, 1);
                 }
+#ifdef _FRANKOS
+                /* Keyboard input arrives via the wrapped getConsole()
+                 * (WM key events), not the USB-CDC ConsoleRxBuf ring —
+                 * reading the ring directly waits forever. */
+                c = getConsole();
+#else
                 c = -1;
                 if (ConsoleRxBufHead != ConsoleRxBufTail)
                 { // if the queue has something in it
                     c = ConsoleRxBuf[ConsoleRxBufTail];
                     ConsoleRxBufTail = (ConsoleRxBufTail + 1) % CONSOLE_RX_BUF_SIZE; // advance the head of the queue
                 }
+#endif
             } while (c == -1);
             ShowCursor(0);
             MMPrintString("\r                 \r");
@@ -6358,6 +6390,11 @@ void CheckSDCard(void)
     }
     diskchecktimer = DISKCHECKRATE;
 }
+/* NOTE (Frank OS): error() calls LoadOptions() after EVERY BASIC error
+ * (MMBasic.c ~4801, "make sure that the option struct is in a clean
+ * state").  basic_run_interpreter() therefore MUST SaveOptions() after
+ * applying its runtime overrides, or the first error restores factory
+ * defaults (DISPLAY_CONSOLE=0 → editor draws nothing). */
 void LoadOptions(void)
 {
     int i = sizeof(struct option_s);

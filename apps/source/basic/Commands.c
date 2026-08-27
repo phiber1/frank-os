@@ -1700,8 +1700,8 @@ int printWrappedText(const char *text, int screenWidth, int listcnt, int all)
 void cmd_help(void)
 {
 	getcsargs(&cmdline, 1);
-	if (!ExistsFile("A:/help.txt"))
-		error("A:/help.txt not found");
+	if (!ExistsFile("B:/help.txt"))
+		error("B:/help.txt not found");
 	if (!argc)
 	{
 		MMPrintString("Enter help and the name of the command or function\r\nUse * for multicharacter wildcard or ? for single character wildcard\r\n");
@@ -1710,7 +1710,7 @@ void cmd_help(void)
 	{
 		int fnbr = FindFreeFileNbr();
 		char *buff = GetTempStrMemory();
-		BasicFileOpen("A:/help.txt", fnbr, FA_READ);
+		BasicFileOpen("B:/help.txt", fnbr, FA_READ);
 		int ListCnt = CurrentY / (FontTable[gui_font >> 4][1] * (gui_font & 0b1111)) + 2;
 		char *p = (char *)getCstring(argv[0]);
 		bool end = false;

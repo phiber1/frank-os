@@ -70,6 +70,11 @@ static volatile int       g_kbuf_tail = 0;
 static hwnd_t             g_hwnd    = HWND_NULL;
 static TaskHandle_t       g_task    = NULL;
 
+/* Display dirty flag: text output marks it, the 25 ms flush timer turns it
+ * into a single wm_invalidate.  Per-character invalidation caused a full-
+ * repaint storm (printScreen: ~1900 chars × ~0.5 ms = 1 s per redraw). */
+volatile bool             g_disp_dirty = false;
+
 /* Closing flag and MMAbort — also read by frankos_platform.c */
 volatile bool             g_closing = false;
 
@@ -139,6 +144,7 @@ static void tbuf_clear(void)
         }
     g_cur_col = 0;
     g_cur_row = 0;
+    g_disp_dirty = true;
 }
 
 /* Non-static wrapper so frankos_platform.c's ClearScreen() can call it
@@ -159,54 +165,289 @@ static void tbuf_scroll_up(void)
 /*
  * basic_textbuf_putc — emit one character into the terminal buffer.
  * Called from frankos_platform.c's DisplayPutC() stub.
- * Handles CR (\r), LF (\n), BS (\b) and normal printable chars.
- * Scrolls the screen when the cursor reaches the last row.
+ *
+ * Implements a VT100/ANSI subset because the interpreter drives the
+ * display through the console character stream: the full-screen editor
+ * positions with ESC[r;cH, clears with ESC[J / ESC[K / ESC[2J, renders
+ * its status line with ESC[7m inverse, and hides/shows the cursor with
+ * ESC[?25l / ESC[?25h.  (Input already spoke VT — arrows and F-keys are
+ * pushed as escape sequences — output finally does too.)
  */
+
+/* Cell-range fill for the platform layer's DrawBox/DrawRectangle. */
+void basic_tbuf_fill_cells(int r0, int c0, int r1, int c1, uint8_t attr)
+{
+    if (r0 < 0) r0 = 0;
+    if (c0 < 0) c0 = 0;
+    if (r1 >= BASIC_ROWS) r1 = BASIC_ROWS - 1;
+    if (c1 >= BASIC_COLS) c1 = BASIC_COLS - 1;
+    for (int r = r0; r <= r1; r++)
+        for (int c = c0; c <= c1; c++) {
+            g_textbuf[r][c].ch   = ' ';
+            g_textbuf[r][c].attr = attr;
+        }
+    g_disp_dirty = true;
+}
+
+/* PicoMite display-layer state: the editor (and any display-console
+ * code) positions output via MX470Cursor -> CurrentX/CurrentY (pixel
+ * coords) and colours via gui_fcolour/gui_bcolour.  These globals are
+ * the single source of truth for the text cursor; g_cur_row/col are
+ * derived from them after every character. */
+extern short CurrentX, CurrentY;
+extern int   gui_fcolour, gui_bcolour;
+
+/* Map a 24-bit RGB colour to the nearest CGA/Frank OS palette index. */
+uint8_t basic_rgb2cga(int rgb)
+{
+    int r = (rgb >> 16) & 0xFF, g = (rgb >> 8) & 0xFF, b = rgb & 0xFF;
+    int hi = (r > 170 || g > 170 || b > 170);
+    int rb = r > 85, gb = g > 85, bb = b > 85;
+    /* CGA: bit0=blue, bit1=green, bit2=red, bit3=bright */
+    uint8_t idx = (uint8_t)((rb ? 4 : 0) | (gb ? 2 : 0) | (bb ? 1 : 0));
+    if (hi && (r > 213 || g > 213 || b > 213) && idx != 7) idx |= 8;
+    if (r > 213 && g > 213 && b > 213) idx = 15;
+    else if (r > 85 && g > 85 && b > 85 && r <= 213) idx = 7;
+    return idx;
+}
+
+static uint8_t disp_attr(void)
+{
+    return (uint8_t)((basic_rgb2cga(gui_bcolour) << 4) |
+                     basic_rgb2cga(gui_fcolour));
+}
+
+/* current SGR state */
+static uint8_t g_vt_attr    = DEFAULT_ATTR;
+static bool    g_vt_inverse = false;
+volatile bool  g_vt_cursor_on = true;      /* ESC[?25h/l + ShowCursor() */
+
+/* escape parser state */
+static enum { VT_GROUND, VT_ESC, VT_CSI } g_vt_state = VT_GROUND;
+static int  g_vt_par[8];
+static int  g_vt_np;
+static bool g_vt_priv;
+
+/* ANSI colour index (0-7) -> CGA palette index */
+static const uint8_t vt_ansi2cga[8] = { 0, 4, 2, 6, 1, 5, 3, 7 };
+
+static uint8_t vt_cur_attr(void) {
+    return g_vt_inverse
+        ? (uint8_t)((g_vt_attr >> 4) | (g_vt_attr << 4))
+        : g_vt_attr;
+}
+
+static void vt_put_cell(int r, int c, uint8_t ch, uint8_t attr) {
+    g_textbuf[r][c].ch   = ch;
+    g_textbuf[r][c].attr = attr;
+}
+
+static void vt_clear_range(int r0, int c0, int r1, int c1) {
+    /* inclusive range in reading order, cleared with the current attr */
+    uint8_t a = vt_cur_attr();
+    for (int r = r0; r <= r1; r++) {
+        int cs = (r == r0) ? c0 : 0;
+        int ce = (r == r1) ? c1 : BASIC_COLS - 1;
+        for (int c = cs; c <= ce; c++)
+            vt_put_cell(r, c, ' ', a);
+    }
+}
+
+static void vt_sgr(void) {
+    if (g_vt_np == 0) { g_vt_par[0] = 0; g_vt_np = 1; }
+    for (int i = 0; i < g_vt_np; i++) {
+        int p = g_vt_par[i];
+        if      (p == 0)  { g_vt_attr = DEFAULT_ATTR; g_vt_inverse = false; }
+        else if (p == 7)  g_vt_inverse = true;
+        else if (p == 27) g_vt_inverse = false;
+        else if (p >= 30 && p <= 37)
+            g_vt_attr = (uint8_t)((g_vt_attr & 0xF0) | vt_ansi2cga[p - 30]);
+        else if (p >= 90 && p <= 97)
+            g_vt_attr = (uint8_t)((g_vt_attr & 0xF0) | (vt_ansi2cga[p - 90] + 8));
+        else if (p == 39)
+            g_vt_attr = (uint8_t)((g_vt_attr & 0xF0) | (DEFAULT_ATTR & 0x0F));
+        else if (p >= 40 && p <= 47)
+            g_vt_attr = (uint8_t)((g_vt_attr & 0x0F) | (vt_ansi2cga[p - 40] << 4));
+        else if (p >= 100 && p <= 107)
+            g_vt_attr = (uint8_t)((g_vt_attr & 0x0F) | ((vt_ansi2cga[p - 100] + 8) << 4));
+        else if (p == 49)
+            g_vt_attr = (uint8_t)(g_vt_attr & 0x0F);
+        /* 1 bold, 4 underline, etc: ignored */
+    }
+}
+
+static void vt_sync_pixel_cursor(void) {
+    CurrentX = (short)(g_cur_col * BASIC_FW);
+    CurrentY = (short)(g_cur_row * BASIC_FH);
+}
+
+static void vt_csi_final(char fin) {
+    int p0 = g_vt_np > 0 ? g_vt_par[0] : 0;
+    int p1 = g_vt_np > 1 ? g_vt_par[1] : 0;
+
+    /* Derive the logical cursor from the display layer's pixel cursor —
+     * MX470Cursor() may have moved it since the last character. */
+    int cx = CurrentX / BASIC_FW, cy = CurrentY / BASIC_FH;
+    if (cx >= 0 && cx < BASIC_COLS) g_cur_col = cx;
+    if (cy >= 0 && cy < BASIC_ROWS) g_cur_row = cy;
+
+    switch (fin) {
+    case 'H': case 'f':
+        g_cur_row = (p0 ? p0 : 1) - 1;
+        g_cur_col = (p1 ? p1 : 1) - 1;
+        if (g_cur_row < 0) g_cur_row = 0;
+        if (g_cur_row >= BASIC_ROWS) g_cur_row = BASIC_ROWS - 1;
+        if (g_cur_col < 0) g_cur_col = 0;
+        if (g_cur_col >= BASIC_COLS) g_cur_col = BASIC_COLS - 1;
+        break;
+    case 'A': g_cur_row -= p0 ? p0 : 1; if (g_cur_row < 0) g_cur_row = 0; break;
+    case 'B': g_cur_row += p0 ? p0 : 1;
+              if (g_cur_row >= BASIC_ROWS) g_cur_row = BASIC_ROWS - 1; break;
+    case 'C': g_cur_col += p0 ? p0 : 1;
+              if (g_cur_col >= BASIC_COLS) g_cur_col = BASIC_COLS - 1; break;
+    case 'D': g_cur_col -= p0 ? p0 : 1; if (g_cur_col < 0) g_cur_col = 0; break;
+    case 'J':
+        if (p0 == 2)
+            vt_clear_range(0, 0, BASIC_ROWS - 1, BASIC_COLS - 1);
+        else if (p0 == 1)
+            vt_clear_range(0, 0, g_cur_row, g_cur_col);
+        else
+            vt_clear_range(g_cur_row, g_cur_col,
+                           BASIC_ROWS - 1, BASIC_COLS - 1);
+        break;
+    case 'K':
+        if (p0 == 2)
+            vt_clear_range(g_cur_row, 0, g_cur_row, BASIC_COLS - 1);
+        else if (p0 == 1)
+            vt_clear_range(g_cur_row, 0, g_cur_row, g_cur_col);
+        else
+            vt_clear_range(g_cur_row, g_cur_col, g_cur_row, BASIC_COLS - 1);
+        break;
+    case 'm':
+        vt_sgr();
+        break;
+    case 'h':
+        if (g_vt_priv && p0 == 25) g_vt_cursor_on = true;
+        break;
+    case 'l':
+        if (g_vt_priv && p0 == 25) g_vt_cursor_on = false;
+        break;
+    default:
+        break;   /* 't' resize hints and anything else: ignored */
+    }
+    /* Only cursor-motion finals may write CurrentX/CurrentY back:
+     * for SGR/erase, g_cur_row/col may be stale relative to a cursor
+     * that MX470Cursor() moved without emitting characters. */
+    switch (fin) {
+    case 'H': case 'f': case 'A': case 'B': case 'C': case 'D':
+        vt_sync_pixel_cursor();
+        break;
+    default:
+        break;
+    }
+}
+
 void basic_textbuf_putc(int c)
 {
+    /* ── escape sequence parsing ── */
+    if (g_vt_state == VT_ESC) {
+        if (c == '[') {
+            g_vt_state = VT_CSI;
+            g_vt_np = 0;
+            g_vt_priv = false;
+            for (int i = 0; i < 8; i++) g_vt_par[i] = 0;
+        } else {
+            g_vt_state = VT_GROUND;   /* unsupported ESC x: swallow */
+        }
+        return;
+    }
+    if (g_vt_state == VT_CSI) {
+        if (c >= '0' && c <= '9') {
+            if (g_vt_np == 0) g_vt_np = 1;
+            if (g_vt_np <= 8)
+                g_vt_par[g_vt_np - 1] = g_vt_par[g_vt_np - 1] * 10 + (c - '0');
+        } else if (c == ';') {
+            if (g_vt_np == 0) g_vt_np = 1;
+            if (g_vt_np < 8) g_vt_np++;
+        } else if (c == '?') {
+            g_vt_priv = true;
+        } else if (c >= 0x40 && c <= 0x7E) {
+            vt_csi_final((char)c);
+            g_vt_state = VT_GROUND;
+            goto done;
+        }
+        /* other intermediates ignored */
+        return;
+    }
+    if (c == 0x1b) {
+        g_vt_state = VT_ESC;
+        return;
+    }
+
+    /* ── ground state: position comes from CurrentX/CurrentY, which
+     * MX470Cursor() (the editor / display layer) sets in pixels.
+     * Wrap is DEFERRED: writing the last column leaves CurrentX equal to
+     * the client width; the wrap (and any scroll) happens only when the
+     * next printable character arrives.  Eager wrap scrolled the screen
+     * whenever a string ended exactly in the last column — which the
+     * editor's right-aligned status line does on every redraw. ── */
+    if (CurrentX < 0) CurrentX = 0;
+    if (CurrentY < 0) CurrentY = 0;
+    if (CurrentX > BASIC_CLIENT_W)
+        CurrentX = BASIC_CLIENT_W;   /* == client width means pending wrap */
+    if (CurrentY > (BASIC_ROWS - 1) * BASIC_FH)
+        CurrentY = (BASIC_ROWS - 1) * BASIC_FH;
+
     if (c == '\r') {
+        CurrentX = 0;
         g_cur_col = 0;
         goto done;
     }
     if (c == '\n') {
-        g_cur_col = 0;
-        g_cur_row++;
-        if (g_cur_row >= BASIC_ROWS) {
+        CurrentX = 0;
+        CurrentY += BASIC_FH;
+        if (CurrentY + BASIC_FH > BASIC_CLIENT_H) {
             tbuf_scroll_up();
-            g_cur_row = BASIC_ROWS - 1;
+            CurrentY = BASIC_CLIENT_H - BASIC_FH;
         }
+        g_cur_col = 0;
+        g_cur_row = CurrentY / BASIC_FH;
         goto done;
     }
     if (c == '\b') {
-        if (g_cur_col > 0) {
-            g_cur_col--;
-        } else if (g_cur_row > 0) {
-            g_cur_row--;
-            g_cur_col = BASIC_COLS - 1;
+        if (CurrentX >= BASIC_FW)
+            CurrentX -= BASIC_FW;
+        else if (CurrentY >= BASIC_FH) {
+            CurrentY -= BASIC_FH;
+            CurrentX = (short)((BASIC_COLS - 1) * BASIC_FW);
         }
-        g_textbuf[g_cur_row][g_cur_col].ch   = ' ';
-        g_textbuf[g_cur_row][g_cur_col].attr  = DEFAULT_ATTR;
+        g_cur_col = CurrentX / BASIC_FW;
+        g_cur_row = CurrentY / BASIC_FH;
+        vt_put_cell(g_cur_row, g_cur_col, ' ', disp_attr());
         goto done;
     }
     if (c < 0x20)
         goto done;   /* ignore other control chars */
 
-    /* Wrap to next line if needed. */
-    if (g_cur_col >= BASIC_COLS) {
-        g_cur_col = 0;
-        g_cur_row++;
-        if (g_cur_row >= BASIC_ROWS) {
-            tbuf_scroll_up();
-            g_cur_row = BASIC_ROWS - 1;
-        }
+    /* pending wrap from the previous character? do it now */
+    if (CurrentX + BASIC_FW > BASIC_CLIENT_W) {
+        CurrentX = 0;
+        CurrentY += BASIC_FH;
     }
-    g_textbuf[g_cur_row][g_cur_col].ch   = (uint8_t)c;
-    g_textbuf[g_cur_row][g_cur_col].attr = DEFAULT_ATTR;
-    g_cur_col++;
+    if (CurrentY + BASIC_FH > BASIC_CLIENT_H) {
+        tbuf_scroll_up();
+        CurrentY = BASIC_CLIENT_H - BASIC_FH;
+    }
+    g_cur_col = CurrentX / BASIC_FW;
+    g_cur_row = CurrentY / BASIC_FH;
+
+    vt_put_cell(g_cur_row, g_cur_col, (uint8_t)c,
+                g_vt_inverse ? (uint8_t)((disp_attr() >> 4) | (disp_attr() << 4))
+                             : disp_attr());
+    CurrentX += BASIC_FW;
 
 done:
-    if (g_hwnd != HWND_NULL)
-        wm_invalidate(g_hwnd);
+    g_disp_dirty = true;
 }
 
 /* ═════════════════════════════════════════════════════════════════════════
@@ -214,17 +455,12 @@ done:
  * ═════════════════════════════════════════════════════════════════════════ */
 
 /*
- * Shadow buffer for dirty-cell tracking.  Stores the last-painted state
- * as (ch, effective_attr) — where effective_attr already has cursor
- * inversion baked in.  Only cells that differ from the shadow are
- * redrawn, which cuts per-frame work from 1896 cells to typically 1-5.
- */
-static cell_t      g_shadow[BASIC_ROWS][BASIC_COLS];
-static uint8_t    *g_last_dst = NULL;  /* detect window moves */
-
-/*
- * Render dirty cells from the text buffer into the Frank OS window
- * framebuffer.  Uses a shadow buffer comparison to skip unchanged cells.
+ * Render the text buffer into the Frank OS window framebuffer.  Windows
+ * paint directly into the shared framebuffer (no backing store), so a
+ * WM_PAINT can mean "another window was just dragged across you" — every
+ * paint must redraw all visible cells.  A full 79x24 render is ~1.6 ms;
+ * the previous dirty-cell shadow optimization left white holes after
+ * occlusion.
  *
  * Framebuffer is nibble-packed 4bpp: high nibble = left (even) pixel,
  *                                     low  nibble = right (odd) pixel.
@@ -306,29 +542,32 @@ static void basic_paint(hwnd_t hwnd)
         return;
     }
 
-    /* Force full repaint when the framebuffer origin changes (window
-     * was moved or fullscreen toggled) — background is re-filled. */
-    bool force = (dst != g_last_dst);
-    g_last_dst = dst;
+    /* Cursor position comes straight from the display layer's pixel
+     * cursor (CurrentX/CurrentY): the editor moves it via MX470Cursor()
+     * without emitting characters, so g_cur_row/col can be stale. */
+    int cur_row = CurrentY / BASIC_FH;
+    int cur_col = CurrentX / BASIC_FW;
+    if (cur_row < 0) cur_row = 0;
+    if (cur_row >= BASIC_ROWS) cur_row = BASIC_ROWS - 1;
+    if (cur_col < 0) cur_col = 0;
+    if (cur_col >= BASIC_COLS) cur_col = BASIC_COLS - 1;
 
     for (int row = 0; row < vis_rows; row++) {
         for (int col = 0; col < vis_cols; col++) {
             uint8_t ch   = g_textbuf[row][col].ch;
             uint8_t attr = g_textbuf[row][col].attr;
 
-            /* Cursor: invert fg/bg on current cell when visible. */
-            bool cursor = (row == g_cur_row && col == g_cur_col && g_cur_vis);
-            uint8_t eff_attr = cursor ? (uint8_t)((attr >> 4) | (attr << 4))
-                                      : attr;
-
-            /* Skip unchanged cells (shadow tracks last-painted state). */
-            if (!force &&
-                g_shadow[row][col].ch == ch &&
-                g_shadow[row][col].attr == eff_attr)
-                continue;
-
-            g_shadow[row][col].ch   = ch;
-            g_shadow[row][col].attr = eff_attr;
+            /* Cursor: invert fg/bg on current cell when visible.  If the
+             * cell's fg==bg (region cleared by DrawBox), inversion would
+             * be invisible — fall back to a gray block. */
+            bool cursor = (row == cur_row && col == cur_col &&
+                           g_cur_vis && g_vt_cursor_on);
+            uint8_t eff_attr = attr;
+            if (cursor) {
+                eff_attr = (uint8_t)((attr >> 4) | (attr << 4));
+                if ((eff_attr & 0x0F) == ((eff_attr >> 4) & 0x0F))
+                    eff_attr = 0x70;   /* gray bg, black fg */
+            }
 
             uint8_t fg = eff_attr & 0x0Fu;
             uint8_t bg = (eff_attr >> 4) & 0x0Fu;
@@ -451,15 +690,38 @@ static bool basic_event(hwnd_t hwnd, const window_event_t *event)
 }
 
 /* ═════════════════════════════════════════════════════════════════════════
- * Cursor blink timer (500 ms period)
+ * Display flush + cursor blink timer (25 ms period)
+ *
+ * One repaint per tick at most: text output and cell fills only set
+ * g_disp_dirty; this timer turns it into a single wm_invalidate.  Also
+ * watches CurrentX/CurrentY and the ShowCursor flag so pure cursor
+ * movement (MX470Cursor emits no characters) still repaints, and
+ * toggles the blink state every 20 ticks (500 ms).
  * ═════════════════════════════════════════════════════════════════════════ */
 
 static void blink_cb(TimerHandle_t t)
 {
     (void)t;
-    g_cur_vis = !g_cur_vis;
-    if (g_hwnd != HWND_NULL)
+    static int   tick = 0;
+    static short last_x = -1, last_y = -1;
+    static bool  last_on = true;
+
+    if (++tick >= 20) {
+        tick = 0;
+        g_cur_vis = !g_cur_vis;
+        g_disp_dirty = true;
+    }
+    if (CurrentX != last_x || CurrentY != last_y ||
+        g_vt_cursor_on != last_on) {
+        last_x  = CurrentX;
+        last_y  = CurrentY;
+        last_on = g_vt_cursor_on;
+        g_disp_dirty = true;
+    }
+    if (g_disp_dirty && g_hwnd != HWND_NULL) {
+        g_disp_dirty = false;
         wm_invalidate(g_hwnd);
+    }
 }
 
 /* ═════════════════════════════════════════════════════════════════════════
@@ -520,9 +782,9 @@ int main(int argc, char **argv)
     wm_set_focus(g_hwnd);
     taskbar_invalidate();
 
-    /* Start cursor blink (500 ms, auto-reload). */
+    /* Start display flush / cursor blink tick (25 ms, auto-reload). */
     TimerHandle_t blink_tmr = xTimerCreate("BLINK",
-                                            pdMS_TO_TICKS(500),
+                                            pdMS_TO_TICKS(25),
                                             pdTRUE, NULL, blink_cb);
     if (blink_tmr)
         xTimerStart(blink_tmr, 0);
@@ -532,6 +794,11 @@ int main(int argc, char **argv)
     basic_run_interpreter();
 
     /* Tear down. */
+    {   /* stop any playback and delete the audio pump task before the
+         * app's code/data disappear (frankos_audio.c) */
+        extern void frankos_audio_shutdown(void);
+        frankos_audio_shutdown();
+    }
     if (blink_tmr) {
         xTimerStop(blink_tmr, 0);
         xTimerDelete(blink_tmr, 0);

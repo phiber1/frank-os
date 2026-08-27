@@ -52,10 +52,8 @@ bool  PIO0                   = false;
 bool  PIO1                   = false;
 bool  PIO2                   = false;
 
-/* Audio.c / VS1053.c */
-char *WAVInterrupt           = NULL;
-bool  WAVcomplete            = false;
-char *modbuff                = NULL;
+/* Audio.c: WAVInterrupt / WAVcomplete / modbuff and the PLAY command are
+ * now provided by frankos_audio.c (OS-mixer-backed implementation). */
 
 /* I2C.c */
 bool  noRTC                  = false;
@@ -183,9 +181,8 @@ void InitGui(void)                              { }
 void CheckGuiTimeouts(void)                     { }
 void DrawKeyboard(int mode)                     { (void)mode; }
 
-/* ── Audio initialisation stubs (Audio.c) ───────────────────────────────── */
-void initAudio(void)                            { }
-void cmd_play(void)                             { not_supported("PLAY"); }
+/* ── Audio (Audio.c) ─────────────────────────────────────────────────────── */
+/* initAudio / cmd_play / CloseAudio / StopAudio now live in frankos_audio.c */
 void cmd_sound(void)                            { not_supported("SOUND"); }
 void fun_mmwave(void)                           { not_supported("MM.WAVE"); }
 

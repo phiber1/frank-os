@@ -16,18 +16,23 @@
 #include <stdint.h>
 #include <stddef.h>
 
-/* "ff.h" resolves to frankos/ff.h which does #include_next "ff.h" →
- * basic/ff.h.  That gives us FRESULT, FIL, DIR, FILINFO, FATFS, TCHAR,
- * BYTE, UINT, DWORD, FSIZE_t, LBA_t, WORD, MKFS_PARM. */
+/* "ff.h" resolves to frankos/ff.h which includes the OS driver tree's
+ * ff.h + ffconf.h — the app-side structs (FIL, DIR, FILINFO, FATFS) are
+ * layout-identical to what the OS FatFS engine expects. */
 #include "ff.h"
+#include <string.h>
 
 /* ── sys_table access ───────────────────────────────────────────────────────
  *
- * Frank OS places its system-call table at the very start of SRAM.
- * Each entry is a function pointer.  The indices below match the values
- * exported in api/m-os-api-ff.h (without including that file).
+ * Frank OS places its system-call table in flash at 0x10FFF000
+ * (M_OS_API_SYS_TABLE_BASE in api/m-os-api.h: 0x10000000 + 16MB - 4KB).
+ * Each entry is a function pointer; slot order verified against
+ * src/sys_table.c.  NOTE: 0x20000000 is OS SRAM, NOT a table mirror —
+ * reading "pointers" there produced wild jumps (the FILES blue screen:
+ * PC=0x10000116 via garbage pointer 0x10000111 from slot 54's offset).
  */
-static void * const * const _sys_tbl = (void * const *)0x20000000UL;
+static void * const * const _sys_tbl =
+    (void * const *)(0x10000000UL + (16UL << 20) - (4UL << 10));
 
 /* sys_table index constants (must match m-os-api-ff.h) */
 #define SYS_F_OPEN      46
@@ -41,8 +46,8 @@ static void * const * const _sys_tbl = (void * const *)0x20000000UL;
 #define SYS_F_OPENDIR   54
 #define SYS_F_CLOSEDIR  55
 #define SYS_F_READDIR   56
-#define SYS_F_UNLINK    57
-#define SYS_F_MKDIR     58
+#define SYS_F_MKDIR     57   /* order verified against src/sys_table.c — */
+#define SYS_F_UNLINK    58   /* m-os-api-ff.h's comments are NOT the truth */
 #define SYS_F_RENAME    59
 #define SYS_F_GETFREE   61
 
@@ -90,6 +95,13 @@ FRESULT f_sync(FIL *fp)
     return ((fn_t)_sys_tbl[SYS_F_SYNC])(fp);
 }
 
+/* The OS ff.h declares f_eof as a real function (PicoMite's header had a
+ * macro).  Pure struct arithmetic — no engine call needed. */
+bool f_eof(FIL *fp)
+{
+    return fp->fptr == fp->obj.objsize;
+}
+
 /* ── Directory operations ───────────────────────────────────────────────── */
 
 FRESULT f_opendir(DIR *dp, const TCHAR *path)
@@ -98,31 +110,99 @@ FRESULT f_opendir(DIR *dp, const TCHAR *path)
     return ((fn_t)_sys_tbl[SYS_F_OPENDIR])(dp, path);
 }
 
-FRESULT f_closedir(DIR *dp)
-{
-    typedef FRESULT (*fn_t)(DIR *);
-    return ((fn_t)_sys_tbl[SYS_F_CLOSEDIR])(dp);
-}
-
 FRESULT f_readdir(DIR *dp, FILINFO *fno)
 {
     typedef FRESULT (*fn_t)(DIR *, FILINFO *);
     return ((fn_t)_sys_tbl[SYS_F_READDIR])(dp, fno);
 }
 
-/* f_findfirst / f_findnext — implemented on top of opendir/readdir */
+/* ── f_findfirst / f_findnext — built on opendir/readdir ────────────────────
+ *
+ * The OS engine is compiled with FF_USE_FIND=0, so its DIR struct has no
+ * `pat` member to carry the pattern.  Patterns are tracked here instead,
+ * in a small table keyed by DIR pointer (MMBasic runs one directory scan
+ * at a time; four slots is generous).  Matching follows FatFS semantics:
+ * case-insensitive, '?' = any one character, '*' = any run of characters.
+ */
+#define FIND_SLOTS 4
+static struct { DIR *dp; char pat[64]; } find_slots[FIND_SLOTS];
+
+static int pat_match(const char *pat, const char *nam)
+{
+    while (*pat) {
+        if (*pat == '*') {
+            while (*pat == '*') pat++;
+            if (!*pat) return 1;
+            for (; *nam; nam++)
+                if (pat_match(pat, nam)) return 1;
+            return 0;
+        }
+        if (!*nam) return 0;
+        if (*pat != '?') {
+            char a = *pat, b = *nam;
+            if (a >= 'a' && a <= 'z') a -= 32;
+            if (b >= 'a' && b <= 'z') b -= 32;
+            if (a != b) return 0;
+        }
+        pat++; nam++;
+    }
+    return *nam == 0;
+}
+
+/* PicoMite's FILES/COPY/KILL loops filter names with FatFS's internal
+ * pattern_matching() (it lived in ff.c, which this port doesn't compile).
+ * The skip/recur arguments are only used by FatFS's internal recursion;
+ * every MMBasic call site passes 0,0. */
+int pattern_matching(const TCHAR *pat, const TCHAR *nam, int skip, int recur)
+{
+    (void)skip; (void)recur;
+    return pat_match(pat, nam);
+}
+
+static FRESULT find_scan(DIR *dp, FILINFO *fno, const char *pat)
+{
+    for (;;) {
+        FRESULT res = f_readdir(dp, fno);
+        if (res != FR_OK || fno->fname[0] == 0)
+            return res;             /* error, or end of directory */
+        if (!pat || !pat[0] || pat_match(pat, fno->fname))
+            return FR_OK;
+    }
+}
+
 FRESULT f_findfirst(DIR *dp, FILINFO *fno, const TCHAR *path, const TCHAR *pattern)
 {
-    (void)pattern;   /* pattern filtering not supported; return all entries */
     FRESULT res = f_opendir(dp, path);
-    if (res == FR_OK)
-        res = f_readdir(dp, fno);
-    return res;
+    if (res != FR_OK)
+        return res;
+    int slot = -1;
+    for (int i = 0; i < FIND_SLOTS; i++)
+        if (find_slots[i].dp == dp || (slot < 0 && find_slots[i].dp == NULL))
+            { slot = i; if (find_slots[i].dp == dp) break; }
+    const char *pat = pattern ? (const char *)pattern : "";
+    if (slot >= 0) {
+        find_slots[slot].dp = dp;
+        strncpy(find_slots[slot].pat, pat, sizeof(find_slots[slot].pat) - 1);
+        find_slots[slot].pat[sizeof(find_slots[slot].pat) - 1] = 0;
+        pat = find_slots[slot].pat;
+    }
+    return find_scan(dp, fno, pat);
 }
 
 FRESULT f_findnext(DIR *dp, FILINFO *fno)
 {
-    return f_readdir(dp, fno);
+    const char *pat = NULL;
+    for (int i = 0; i < FIND_SLOTS; i++)
+        if (find_slots[i].dp == dp) { pat = find_slots[i].pat; break; }
+    return find_scan(dp, fno, pat);
+}
+
+FRESULT f_closedir(DIR *dp)
+{
+    for (int i = 0; i < FIND_SLOTS; i++)
+        if (find_slots[i].dp == dp) find_slots[i].dp = NULL;
+    typedef FRESULT (*fn_t)(DIR *);
+    return ((fn_t)_sys_tbl[SYS_F_CLOSEDIR])(dp);
 }
 
 /* ── Filesystem-level operations ────────────────────────────────────────── */
@@ -222,17 +302,8 @@ FRESULT f_expand(FIL *fp, FSIZE_t fsz, BYTE opt)
     return FR_NOT_ENABLED;
 }
 
-FRESULT f_mkfs(const TCHAR *path, const MKFS_PARM *opt, void *work, UINT len)
-{
-    (void)path; (void)opt; (void)work; (void)len;
-    return FR_NOT_ENABLED;
-}
-
-FRESULT f_fdisk(BYTE pdrv, const LBA_t ptbl[], void *work)
-{
-    (void)pdrv; (void)ptbl; (void)work;
-    return FR_NOT_ENABLED;
-}
+/* f_mkfs / f_fdisk: not declared by the OS ff.h (FF_USE_MKFS=0) and not
+ * called by MMBasic — omitted entirely. */
 
 FRESULT f_setcp(WORD cp)
 {

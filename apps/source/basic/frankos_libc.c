@@ -565,13 +565,11 @@ char end[0];
  * interpreter's main loop and text output still work.
  * ══════════════════════════════════════════════════════════════════════════ */
 
-/* Audio */
+/* Audio — CurrentlyPlaying / PlayingStr / CloseAudio moved to
+ * frankos_audio.c (real OS-mixer implementation) */
 volatile int  AUDIO_WRAP           = 0;
 volatile int  AudioOutput          = 0;
-volatile int  CurrentlyPlaying     = 0;
 char         *WAVfilename          = NULL;
-char         *PlayingStr           = "";
-void CloseAudio(void)              { }
 
 /* Backlight / display hardware */
 volatile int  BacklightChannel     = 0;
@@ -579,7 +577,10 @@ volatile int  BacklightSlice       = 0;
 volatile int  KeyboardlightSlice   = 0;
 volatile int  CameraSlice          = 0;
 volatile int  SSD1963data          = 0;
-volatile int  DisplayNotSet        = 1;
+/* Declared `extern void DisplayNotSet(void)` — used as a sentinel ADDRESS
+ * in ReadBuffer comparisons AND installed into Draw fn pointers by
+ * OPTION LCDPANEL NOCONSOLE, so it must be a real (no-op) function. */
+void DisplayNotSet(void)           { }
 void SetBacklightSSD1963(int v)    { (void)v; }
 void Display_Refresh(void)         { }
 
@@ -654,8 +655,13 @@ void spi_write_data(int a)         { (void)a; }
 /* Serial */
 void SerialOpen(int a, int b, int c, int d, int e, int f)
                                    { (void)a;(void)b;(void)c;(void)d;(void)e;(void)f; }
-volatile int SerialRxStatus        = 0;
-volatile int SerialTxStatus        = 0;
+/* These are FUNCTIONS in Serial.h (int fn(int comnbr)) — they were once
+ * stubbed as int VARIABLES here, so callers (e.g. cmd_close's TX-drain
+ * loop) branched to the variable's address and executed data: blue
+ * screen on every CLOSE #n.  This file doesn't include Serial.h, so the
+ * compiler never saw the conflict. */
+int SerialRxStatus(int comnbr)     { (void)comnbr; return 0; }  /* no RX data    */
+int SerialTxStatus(int comnbr)     { (void)comnbr; return 0; }  /* TX buffer idle */
 void com1_interrupt(void)          { }
 void com2_interrupt(void)          { }
 volatile int com1_ilevel           = 0;
@@ -736,7 +742,7 @@ int  read_biosversion(void)       { return 0; }
 volatile int stepper_initialized  = 0;
 
 /* Pattern matching / pin search (MMBasic internals) */
-void pattern_matching(void)       { }
+/* pattern_matching: real implementation in frankos_ff.c */
 void pinsearch(void)              { }
 
 /* dirOK: directory-change flag used by file I/O commands */
@@ -860,7 +866,7 @@ void I2C_Slave_Receive_IntLine(void)  {}
 /* ── Wii / Nunchuck send, controller polling ────────────────────────────── */
 void WiiSend(void)       {}
 void classicproc(void)   {}
-void checkWAVinput(void) {}
+/* checkWAVinput moved to frankos_audio.c */
 void nunproc(void)       {}
 void processgps(void)    {}
 void readcontroller(void){}

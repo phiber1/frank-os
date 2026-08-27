@@ -690,6 +690,7 @@ void edit(unsigned char *cmdline, bool cmdfile)
 }
 
 /*  @endcond */
+
 void cmd_edit(void)
 {
     edit(cmdline, true);
@@ -937,7 +938,10 @@ void FullScreenEditor(int xx, int yy, char *fname, int edit_buff_size, bool cmdf
 
                 c = MMInkey();
 
-            if (statuscount++ == 5000)
+            /* Frank OS: getConsole() sleeps ~5 ms per empty poll, so the
+             * original 5000 busy-polls meant a ~25 s wait; 20 polls ≈ 100 ms
+             * of idle before the L:/C:/INS status is drawn. */
+            if (statuscount++ == 20)
                 PrintStatus();
         } while (c == -1);
         ShowCursor(false);

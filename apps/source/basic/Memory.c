@@ -89,7 +89,11 @@ uint8_t *tilefcols_w;
 uint8_t *tilebcols_w;
 uint16_t HDMIlines[2][848] = {0};
 volatile int X_TILE = 80, Y_TILE = 40;
-uint32_t core1stack[128];
+/* Frank OS: no MMBasic core-1 exists, but ExecuteProgram checks this
+ * stack canary after EVERY statement and raises "CPU2 Stack overflow"
+ * if it is missing — which tore down background audio (and reset state)
+ * on every immediate command.  Pre-stamp the canary. */
+uint32_t core1stack[128] = {0x12345678};
 volatile int ytileheight = 480 / 12;
 #else
 uint16_t M_Foreground[16] = {

@@ -5100,7 +5100,11 @@ void __not_in_flash_func(UpdateCore)()
         }
     }
 }
-uint32_t core1stack[512];
+/* Frank OS: core 1 belongs to the OS (HDMICore is never launched), but
+ * ExecuteProgram checks this canary after EVERY statement and raises
+ * "CPU2 Stack overflow" without it — tearing down background audio on
+ * every immediate command.  Pre-stamp the canary. */
+uint32_t core1stack[512] = {0x12345678};
 #endif
 #endif
 #ifndef rp2350

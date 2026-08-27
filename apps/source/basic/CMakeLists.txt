@@ -49,7 +49,6 @@ set(MMBASIC_SOURCES
     BmpDecoder.c
     picojpeg.c
     upng.c
-    hxcmod.c
 )
 
 # ── Frank OS platform layer ──────────────────────────────────────────────────
@@ -59,6 +58,7 @@ set(FRANKOS_SOURCES
     frankos_alloc.c
     frankos_libc.c
     frankos_stubs.c
+    frankos_audio.c
     frankos_ff.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../src/font8x16.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../api/m-os-api-sdtfn.c
@@ -119,10 +119,10 @@ target_compile_options(basic PRIVATE
 )
 
 set_source_files_properties(MATHS.c      PROPERTIES COMPILE_FLAGS -Os)
+set_source_files_properties(frankos_audio.c PROPERTIES COMPILE_FLAGS -Os)
 set_source_files_properties(Editor.c     PROPERTIES COMPILE_FLAGS -Os)
 set_source_files_properties(aes.c        PROPERTIES COMPILE_FLAGS -Os)
 set_source_files_properties(re.c         PROPERTIES COMPILE_FLAGS -Os)
-set_source_files_properties(hxcmod.c     PROPERTIES COMPILE_FLAGS -Os)
 set_source_files_properties(GPS.c        PROPERTIES COMPILE_FLAGS -Os)
 set_source_files_properties(I2C.c        PROPERTIES COMPILE_FLAGS -Os)
 set_source_files_properties(picojpeg.c   PROPERTIES COMPILE_FLAGS -Os)

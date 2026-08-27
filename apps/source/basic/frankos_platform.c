@@ -216,6 +216,19 @@ bool   mergedread           = false;
 /* Draw function pointers — point to safe no-op stubs so indirect calls
  * through these pointers (e.g. in MX470Display / Editor.c) don't crash. */
 static void nop_DrawPixel(int x, int y, int c) { (void)x;(void)y;(void)c; }
+static void real_DrawRectangle(int x1,int y1,int x2,int y2,int c)
+{
+    extern uint8_t basic_rgb2cga(int rgb);
+    extern void basic_tbuf_fill_cells(int r0, int c0, int r1, int c1,
+                                      uint8_t attr);
+    /* Keep the current fg colour in the cleared cells: an fg==bg cell
+     * makes the inverse-video cursor invisible. */
+    uint8_t bg = basic_rgb2cga(c);
+    uint8_t fg = basic_rgb2cga(gui_fcolour);
+    if (fg == bg) fg = (uint8_t)(bg ^ 0x07);
+    basic_tbuf_fill_cells(y1 / 16, x1 / 8, y2 / 16, x2 / 8,
+                          (uint8_t)((bg << 4) | fg));
+}
 static void nop_DrawRectangle(int x1,int y1,int x2,int y2,int c)
 { (void)x1;(void)y1;(void)x2;(void)y2;(void)c; }
 static void nop_DrawBitmap(int x1,int y1,int w,int h,int s,int fc,int bc,unsigned char *bm)
@@ -227,7 +240,7 @@ static void nop_ReadBuffer(int x1,int y1,int x2,int y2,unsigned char *c)
 { (void)x1;(void)y1;(void)x2;(void)y2;(void)c; }
 
 void (*DrawPixel)(int, int, int)                      = nop_DrawPixel;
-void (*DrawRectangle)(int, int, int, int, int)        = nop_DrawRectangle;
+void (*DrawRectangle)(int, int, int, int, int)        = real_DrawRectangle;
 void (*DrawBitmap)(int,int,int,int,int,int,int,unsigned char*) = nop_DrawBitmap;
 void (*ScrollLCD)(int)                                = nop_ScrollLCD;
 void (*DrawBuffer)(int,int,int,int,unsigned char*)    = nop_DrawBuffer;
@@ -255,11 +268,14 @@ void ClearScreen(int c)
     /* Delegate to frankos_main.c which has the correct g_textbuf type. */
     extern void basic_tbuf_clear(void);
     basic_tbuf_clear();
+    CurrentX = 0;
+    CurrentY = 0;
 }
 
 void ShowCursor(int show)
 {
-    (void)show;
+    extern volatile bool g_vt_cursor_on;
+    g_vt_cursor_on = (show != 0);
     /* Cursor visible state is controlled by the blink timer in frankos_main.c. */
 }
 
@@ -311,7 +327,20 @@ int GetJustification(char *p, int *jh, int *jv, int *jo)
 void DrawLine(int x1,int y1,int x2,int y2,int w,int c)
 { (void)x1;(void)y1;(void)x2;(void)y2;(void)w;(void)c; }
 void DrawBox(int x1,int y1,int x2,int y2,int w,int c,int fill)
-{ (void)x1;(void)y1;(void)x2;(void)y2;(void)w;(void)c;(void)fill; }
+{
+    /* Editor/display-console clears regions with DrawBox; render it as
+     * a text-cell fill (background colour) in the terminal buffer. */
+    (void)w; (void)c;
+    extern uint8_t basic_rgb2cga(int rgb);
+    extern void basic_tbuf_fill_cells(int r0, int c0, int r1, int c1,
+                                      uint8_t attr);
+    int c0 = x1 / 8,  r0 = y1 / 16;
+    int c1 = x2 / 8,  r1 = y2 / 16;
+    uint8_t bg = basic_rgb2cga(fill);
+    uint8_t fg = basic_rgb2cga(gui_fcolour);
+    if (fg == bg) fg = (uint8_t)(bg ^ 0x07);   /* keep cursor inversion visible */
+    basic_tbuf_fill_cells(r0, c0, r1, c1, (uint8_t)((bg << 4) | fg));
+}
 void DrawRBox(int x1,int y1,int x2,int y2,int r,int c,int fill)
 { (void)x1;(void)y1;(void)x2;(void)y2;(void)r;(void)c;(void)fill; }
 void DrawCircle(int x,int y,int r,int w,int c,int fill,MMFLOAT aspect)
@@ -379,8 +408,8 @@ void __wrap_sleep_us(uint64_t us)
 
 /* Audio stubs (Audio.c calls these; no audio hardware on Frank OS) */
 void start_i2s(int pio, int sm)       { (void)pio; (void)sm; }
-void pcm_init(int rate, int channels) { (void)rate; (void)channels; }
-void pcm_cleanup(void)      { }
+/* pcm_init/pcm_cleanup stubs removed — frankos_audio.c drives the OS
+ * mixer directly through the sys_table. */
 void pcm_submit(void)       { }
 
 /* Various PicoMite init stubs */
@@ -680,7 +709,26 @@ reset:
     Option.Width           = 79;  /* terminal width */
     Option.Height          = 24;  /* terminal height */
     Option.SerialConsole   = 0;   /* no UART serial console */
+    Option.NoScroll        = 1;   /* ScrollLCD is a stub — force the
+                                     editor's redraw-instead-of-scroll */
     Option.CPU_Speed       = 150000;
+
+    /* B: (the OS-managed SD card) is the default — and only — drive.
+     * A: has no physical backing and errors out in drivecheck().
+     * CombinedCS satisfies cmd_drive's "B: drive enabled" check. */
+    Option.CombinedCS      = 1;
+    {
+        extern int FatFSFileSystem, FatFSFileSystemSave;
+        FatFSFileSystem = FatFSFileSystemSave = 1;
+    }
+
+    /* ResetOptions() ended with SaveOptions(), stashing FACTORY defaults
+     * (DISPLAY_CONSOLE=0, Width=80) in the emulated options flash — and
+     * error() calls LoadOptions() after EVERY BASIC error (MMBasic.c
+     * ~4801), which clobbered the overrides above on the first error
+     * (symptom: EDIT drew nothing — its output is gated on
+     * DISPLAY_CONSOLE).  Persist our values so that reload is a no-op. */
+    SaveOptions();
 
     /* Point program memory at our RAM buffer. */
     flash_progmemory = g_basic_prog_buf;
