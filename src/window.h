@@ -190,6 +190,7 @@ void wm_set_pending_icon32(const uint8_t *icon_data);
  * Returns the hwnd of the topmost window containing the point,
  * or HWND_NULL if the point is on the desktop. */
 hwnd_t wm_window_at_point(int16_t x, int16_t y);
+void wm_refresh_cursor_hide(void);
 
 /* Force a full clear on the next composite (layout changed) */
 void wm_force_full_repaint(void);

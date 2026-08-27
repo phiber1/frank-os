@@ -308,6 +308,7 @@ void wm_destroy_window(hwnd_t hwnd) {
     memset(win, 0, sizeof(*win));
     fs_state[hwnd - 1].active = false;
     taskbar_invalidate();
+    wm_refresh_cursor_hide();
 
     /* Post WM_SETFOCUS after the window slot is cleared — the handler
      * may call wm_get_window() and we need a consistent state. */
@@ -331,6 +332,7 @@ void wm_destroy_window(hwnd_t hwnd) {
 void wm_show_window(hwnd_t hwnd) {
     if (!valid_hwnd(hwnd)) return;
     windows[hwnd - 1].flags |= WF_VISIBLE | WF_DIRTY | WF_FRAME_DIRTY;
+    wm_refresh_cursor_hide();
 }
 
 void wm_hide_window(hwnd_t hwnd) {
@@ -338,6 +340,7 @@ void wm_hide_window(hwnd_t hwnd) {
     rect_t frame = windows[hwnd - 1].frame;
     windows[hwnd - 1].flags &= ~WF_VISIBLE;
     wm_add_expose_rect(&frame);
+    wm_refresh_cursor_hide();
 }
 
 void wm_minimize_window(hwnd_t hwnd) {
@@ -346,6 +349,7 @@ void wm_minimize_window(hwnd_t hwnd) {
     windows[hwnd - 1].state = WS_MINIMIZED;
     windows[hwnd - 1].flags &= ~WF_VISIBLE;
     wm_add_expose_rect(&frame);
+    wm_refresh_cursor_hide();
 
     /* If minimizing the focused window, move focus to the next visible
      * window via wm_set_focus() so WM_KILLFOCUS is properly dispatched
@@ -701,6 +705,27 @@ hwnd_t wm_window_at_point(int16_t x, int16_t y) {
         }
     }
     return HWND_NULL;
+}
+
+/* Re-evaluate the mouse-pointer hide state at the current pointer
+ * position.  The per-mouse-move check in main.c only runs when the
+ * pointer moves; when a WF_HIDE_CURSOR window appears (or vanishes)
+ * UNDER a stationary pointer, the stale visibility state persists —
+ * a visible pointer over such a window then gets erased/re-stamped by
+ * every repaint, which the user sees as pulsation. */
+void wm_refresh_cursor_hide(void) {
+    int16_t mx, my;
+    wm_get_cursor_pos(&mx, &my);
+    bool hide = false;
+    hwnd_t hover = wm_window_at_point(mx, my);
+    if (hover != HWND_NULL) {
+        window_t *hw = &windows[hover - 1];
+        if (hw->flags & WF_HIDE_CURSOR) {
+            if (theme_hit_test(&hw->frame, hw->flags, mx, my) == HT_CLIENT)
+                hide = true;
+        }
+    }
+    cursor_set_visible(!hide);
 }
 
 /*==========================================================================
