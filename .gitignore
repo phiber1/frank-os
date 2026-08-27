@@ -6,3 +6,21 @@ apps/compiled/
 .DS_Store
 Thumbs.db
 tmp/
+# In-tree build artifacts (build out-of-tree in build/ instead)
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.pio.h
+lib/*/*.a
+generated/
+memmap.ld
+pico_flash_region.ld
+*.orig
+pioasm/
+pioasm-install/
+
+# In-tree vendored/fetched SDK checkouts
+/DispHSTX/
+/FREERTOS_KERNEL/
+/pico-sdk/
