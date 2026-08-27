@@ -175,7 +175,12 @@ static void nc_send_cmd(const char *cmd) {
 /* -------------------------------------------------------------------------- */
 
 static void nc_process_line(const char *line, uint16_t len) {
-    printf("[NC RX] %s\n", line);
+    /* Do NOT log per-chunk +SRECV lines: an 840KB transfer emits 800+ of
+     * them, and if the USB CDC console backs up, printf BLOCKS this task
+     * — the very task that delivers socket data — starving the receiving
+     * app into a timeout while the C6 keeps streaming. */
+    if (strncmp(line, "+SRECV:", 7) != 0)
+        printf("[NC RX] %s\n", line);
 
     /* ---- Final responses ---- */
 
@@ -339,7 +344,26 @@ static void nc_process_line(const char *line, uint16_t len) {
 /* netcard_poll — drain RX FIFO, feed through state machine                   */
 /* -------------------------------------------------------------------------- */
 
+/* Serializes the RX state machine: netcard_poll is called both by
+ * netcard_task (continuously) and by the app task inside nc_wait_response
+ * (during commands).  Unserialized, two tasks interleave on line_buf /
+ * data_pos / data_remaining — the double-decrement skips the ==0 check,
+ * the countdown wraps, and srecv_buf[data_pos++] runs off the heap
+ * (observed hardfault: BFAR 0x20FFFEF7 during a transfer abort while
+ * both tasks were polling).  Try-lock: a contended caller just returns —
+ * the holder is already draining the same FIFO. */
+static SemaphoreHandle_t poll_mtx;
+
+static void netcard_poll_locked(void);
+
 static void netcard_poll(void) {
+    if (poll_mtx == NULL || xSemaphoreTake(poll_mtx, 0) != pdTRUE)
+        return;
+    netcard_poll_locked();
+    xSemaphoreGive(poll_mtx);
+}
+
+static void netcard_poll_locked(void) {
     while (serial_readable()) {
         uint8_t c = serial_read_byte();
 
@@ -635,8 +659,8 @@ static bool netcard_probe_ex(int attempts, uint32_t timeout, uint32_t drain_ms) 
     while (xTaskGetTickCount() < settle) {
         while (serial_readable()) {
             uint8_t c = serial_read_byte();
-            printf("[NC RAW] 0x%02x%s\n", c,
-                   (c >= 0x20 && c < 0x7f) ? " printable" : "");
+            printf("[NC RAW] 0x%02x '%c'\n", c,
+                   (c >= 0x20 && c < 0x7f) ? (char)c : '.');
             drained++;
         }
         vTaskDelay(1);
@@ -654,9 +678,12 @@ static bool netcard_probe_ex(int attempts, uint32_t timeout, uint32_t drain_ms) 
     return false;
 }
 
-/* Boot-time probe: thorough (5 attempts, full timeout). */
-static bool netcard_probe(void) {
-    return netcard_probe_ex(5, NC_TIMEOUT_DEFAULT, 500);
+/* Boot-time probe: quick (2 attempts, short timeout) — a missing or
+ * non-AT modem (e.g. Fruit Jam's stock ESP32-C6 firmware) shouldn't tie
+ * up the netcard task for ~25 s at every boot. The user can re-probe
+ * from Network settings at any time. */
+static bool __attribute__((unused)) netcard_probe(void) {
+    return netcard_probe_ex(2, 1500, 500);
 }
 
 /* After a successful probe: mark available and auto-reconnect if configured. */
@@ -683,6 +710,22 @@ static void netcard_task(void *params) {
     /* Initialize PIO UART here so its printfs land in the USB CDC log. */
     serial_init();
 
+#ifdef FRANK_BOARD_FRUITJAM
+    /* Fruit Jam: the onboard ESP32-C6 runs the frank-netcard firmware
+     * (ported to C6, UART0 on GPIO 8/9). The DAC init pulsed the shared
+     * PERIPH_RESET just before this task started, so the C6 is booting
+     * now: drain its ROM boot chatter and allow three probe attempts.
+     * With Adafruit's stock (NINA) firmware still installed the probe
+     * fails quickly and harmlessly — flash the C6 and re-probe from
+     * Network settings. */
+    if (netcard_probe_ex(3, 1500, 800)) {
+        netcard_on_modem_ready();
+    } else {
+        netcard_available_flag = false;
+        printf("[NC] No netcard on ESP32-C6 — flash frank-netcard-c6 "
+               "and re-probe from Network settings\n");
+    }
+#else
     /* Quick probe — if no modem, stay in the loop (unavailable) so the user
      * can reconfigure the RX/TX pins from the Network settings app. */
     if (netcard_probe()) {
@@ -691,6 +734,7 @@ static void netcard_task(void *params) {
         netcard_available_flag = false;
         printf("[NC] No modem detected — awaiting pin reconfiguration\n");
     }
+#endif
 
     /* Main loop: poll UART + process command queue */
     for (;;) {
@@ -790,6 +834,8 @@ void netcard_init_async(void) {
 
     /* Allocate receive buffer from heap to save BSS space */
     srecv_buf = (uint8_t *)pvPortMalloc(NC_SRECV_BUF_SIZE);
+
+    poll_mtx = xSemaphoreCreateMutex();
 
     cmd_queue = xQueueCreate(CMD_QUEUE_LEN, sizeof(net_cmd_t));
 

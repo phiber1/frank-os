@@ -32,26 +32,33 @@
 #include "uart_rx.pio.h"
 
 /* PIO UART on PIO2. PIO0 = PS/2 (base 0), PIO1 = I2S (base 0);
- * only PIO2 is free to set GPIO base = 16 so pins 38/39 are reachable. */
+ * only PIO2 is free to take the board-specific GPIO base needed to reach
+ * the netcard pins (base 16 on M2 for 38/39, base 0 on Fruit Jam for 8/9). */
 #define SERIAL_PIO      pio2
 #define SERIAL_PIO_IRQ  PIO2_IRQ_0
-#define SERIAL_PIO_GPIO_BASE  16
+#define SERIAL_PIO_GPIO_BASE  NETCARD_PIO_GPIO_BASE
 
-/* ESP-01 pins: our TX = GPIO39 (to ESP RX), our RX = GPIO38 (from ESP TX) */
+/* ESP netcard pins: our TX drives ESP RX, our RX samples ESP TX */
 #define PIN_TX          NETCARD_PIN_TX
 #define PIN_RX          NETCARD_PIN_RX
 
 #define SERIAL_BAUD     NETCARD_BAUD
 
-/* PIO2 GPIO base window: pins must fall in [16, 47]. */
-#define SERIAL_PIN_MIN  16
-#define SERIAL_PIN_MAX  47
+/* PIO2 GPIO base window: pins must fall in [base, base+31]. */
+#define SERIAL_PIN_MIN  SERIAL_PIO_GPIO_BASE
+#define SERIAL_PIN_MAX  (SERIAL_PIO_GPIO_BASE + 31)
 
 /* Interrupt-driven RX ring buffer (must be power of 2).
  * Web pages arrive as multi-KB +SRECV streams — the netcard task must
  * be able to drain the FIFO without losing bytes even under scheduling
  * jitter.  2KB comfortably holds several +SRECV events. */
-#define RX_BUF_SIZE     2048
+/* Must ride out the longest scheduler-suspended window: the FatFS engine
+ * wraps SD operations in vTaskSuspendAll, and SD erase-block stalls can
+ * reach ~500ms — during which netcard_task cannot drain this ring while
+ * the C6 streams on at 115200 (11.5KB/s, NO flow control on the wire).
+ * 2KB (178ms) silently dropped bytes mid-+SRECV, desyncing the binary
+ * framing and killing large transfers at random offsets.  32KB ≈ 2.8s. */
+#define RX_BUF_SIZE     32768
 #define RX_BUF_MASK     (RX_BUF_SIZE - 1)
 
 static uint tx_offset, rx_offset;
@@ -68,6 +75,10 @@ static inline uint8_t pio_uart_read_byte_raw(void) {
     return (uint8_t)(pio_sm_get(SERIAL_PIO, rx_sm) >> 24);
 }
 
+/* TEMP DIAG: byte accounting for the RX path (large-transfer stalls). */
+volatile uint32_t serial_rx_total_bytes   = 0;
+volatile uint32_t serial_rx_dropped_bytes = 0;
+
 /* PIO IRQ handler — drains PIO RX FIFO into the ring buffer */
 static void pio_rx_irq_handler(void) {
     while (!pio_sm_is_rx_fifo_empty(SERIAL_PIO, rx_sm)) {
@@ -76,6 +87,9 @@ static void pio_rx_irq_handler(void) {
         if (next_head != rx_tail) {     /* drop byte if buffer full */
             rx_buf[rx_head] = c;
             rx_head = next_head;
+            serial_rx_total_bytes++;
+        } else {
+            serial_rx_dropped_bytes++;
         }
     }
 }
@@ -110,10 +124,13 @@ void serial_init(void) {
     rx_buf = (volatile uint8_t *)pvPortMalloc(RX_BUF_SIZE);
 
     /* PIO2 gpio base must be set BEFORE claiming SMs or initialising
-     * programs so pin offsets resolve against the 16-47 window. */
-    int base_rc = pio_set_gpio_base(SERIAL_PIO, SERIAL_PIO_GPIO_BASE);
-    if (base_rc != 0) {
-        printf("PIO UART: pio_set_gpio_base failed (%d)\n", base_rc);
+     * programs so pin offsets resolve against the right window. Skip
+     * when it already matches — the SDK call fails (harmlessly) once
+     * another driver (audio) has claimed SMs on this PIO. */
+    if (pio_get_gpio_base(SERIAL_PIO) != SERIAL_PIO_GPIO_BASE) {
+        int base_rc = pio_set_gpio_base(SERIAL_PIO, SERIAL_PIO_GPIO_BASE);
+        if (base_rc != 0)
+            printf("PIO UART: pio_set_gpio_base failed (%d)\n", base_rc);
     }
 
     tx_sm = pio_claim_unused_sm(SERIAL_PIO, true);
