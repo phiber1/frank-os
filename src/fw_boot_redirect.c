@@ -20,14 +20,15 @@
  */
 
 #include <stdint.h>
+#include "board_config.h"
 
 #define FLASH_MAGIC_OVER  0x3836d91au
 #define ZB_FLASH_OFFSET   ((16ul << 20) - (1ul << 20) - (4ul << 10))  /* 0xEFF000 */
 #define ZB_XIP_ADDR       ((volatile uint32_t *)(0x10000000 + ZB_FLASH_OFFSET))
 
-/* PS/2 keyboard GPIO pins (board_config.h values) */
-#define PS2_CLK_PIN  2
-#define PS2_DATA_PIN 3
+/* PS/2 keyboard GPIO pins (from board_config.h) */
+#define PS2_CLK_PIN  PS2_PIN_CLK
+#define PS2_DATA_PIN PS2_PIN_DATA
 
 /* GPIO register addresses */
 #define IO_BANK0_BASE     0x40028000u

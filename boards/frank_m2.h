@@ -23,6 +23,9 @@
 
 pico_board_cmake_set(PICO_PLATFORM, rp2350)
 
+// For board detection (FRANK OS board_config.h keys off FRANK_BOARD_M2)
+#define FRANK_BOARD_M2 1
+
 // --- RP2350 VARIANT ---
 #define PICO_RP2350A 0
 

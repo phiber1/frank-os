@@ -24,10 +24,19 @@
 /* Memory */
 #define configSUPPORT_DYNAMIC_ALLOCATION        1
 #define configSUPPORT_STATIC_ALLOCATION         1
-#if DISPHSTX_USE_VGA
-#define configTOTAL_HEAP_SIZE                   ((size_t)(120 * 1024))
+/* The USB host stack (TinyUSB host + Pico-PIO-USB on Fruit Jam) needs
+ * ~17KB of static RAM; carve it out of the heap when USB HID is enabled.
+ * On boards with PSRAM (Fruit Jam) apps load to PSRAM, not this heap. */
+#ifdef USB_HID_ENABLED
+#define FRANK_HEAP_USB_RESERVE  23
 #else
-#define configTOTAL_HEAP_SIZE                   ((size_t)(135 * 1024))
+#define FRANK_HEAP_USB_RESERVE  0
+#endif
+
+#if DISPHSTX_USE_VGA
+#define configTOTAL_HEAP_SIZE                   ((size_t)((120 - FRANK_HEAP_USB_RESERVE) * 1024))
+#else
+#define configTOTAL_HEAP_SIZE                   ((size_t)((135 - FRANK_HEAP_USB_RESERVE) * 1024))
 #endif
 #define configAPPLICATION_ALLOCATED_HEAP        0
 

@@ -101,6 +101,7 @@ static void init_default_256_palette(void) {
  * Internal: configure and start a video mode via DispHSTX
  * ====================================================================== */
 
+
 static void start_mode_640x480x16(void) {
     sDispHstxVModeState *vmode = &DispHstxVMode;
     DispHstxVModeInitTime(vmode, &DispHstxVModeTimeList[vmodetime_640x480_fast]);

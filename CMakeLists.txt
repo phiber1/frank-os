@@ -15,7 +15,17 @@ endif()
 
 cmake_minimum_required(VERSION 3.13)
 
-set(PICO_BOARD frank_m2)
+# Default board (override with -DPICO_BOARD=frank_m2 or a CMake preset)
+if(NOT DEFINED PICO_BOARD)
+    set(PICO_BOARD fruitjam)
+endif()
+
+# Fruit Jam has no PS/2 ports — USB HID (via PIO-USB) is the input path,
+# so it defaults ON. The native USB-C stays a CDC console alongside it.
+# The boot sequence mirrors the proven harness in ~/frank_stuff/usbtest.
+if(PICO_BOARD STREQUAL "fruitjam" AND NOT DEFINED USB_HID_ENABLED)
+    set(USB_HID_ENABLED 1)
+endif()
 set(PICO_BOARD_HEADER_DIRS ${CMAKE_CURRENT_LIST_DIR}/boards)
 set(PICO_PLATFORM rp2350-arm-s)
 
@@ -121,6 +131,7 @@ add_executable(frankos
     src/sound.c
     src/snd.c
     src/audio.c
+    src/tlv320dac3100.c
     src/startup_sound.c
     src/startup_wav.S
     src/freertos_ext.c
@@ -247,8 +258,11 @@ target_link_options(frankos PRIVATE
     -Wl,--undefined=sys_table_ptrs
 )
 
-# USB HID Host uses the USB port — disable CDC stdio, use UART instead
-if(USB_HID_ENABLED)
+# Stdio routing:
+#  - Fruit Jam: USB HID rides PIO-USB (GPIO 1/2), so the native USB-C
+#    controller stays a CDC device — console and HID coexist.
+#  - M2: USB HID uses the native controller, so CDC must yield to UART.
+if(USB_HID_ENABLED AND NOT PICO_BOARD STREQUAL "fruitjam")
     pico_enable_stdio_usb(frankos 0)
     pico_enable_stdio_uart(frankos 1)
 else()

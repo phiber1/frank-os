@@ -29,6 +29,7 @@
 #include "ps2.h"
 #include "keyboard.h"
 #include "sdcard_init.h"
+#include "tlv320dac3100.h"
 #include "terminal.h"
 #include "shell.h"
 #include "menu.h"
@@ -88,8 +89,8 @@ const uint8_t erase_block[4096] __attribute__((aligned(4096), section(".erase_bl
 #define BM_PADS_BANK0_BASE 0x40038000u
 #define BM_SIO_BASE         0xD0000000u
 #define BM_GPIO_IN_REG      (*(volatile uint32_t *)(BM_SIO_BASE + 0x008))
-#define BM_PS2_CLK_PIN      2
-#define BM_PS2_DATA_PIN     3
+#define BM_PS2_CLK_PIN      PS2_PIN_CLK
+#define BM_PS2_DATA_PIN     PS2_PIN_DATA
 
 __attribute__((constructor))
 static void before_main(void) {
@@ -374,9 +375,26 @@ void __attribute__((used)) hardfault_c_handler(uint32_t *stack, uint32_t lr_val)
 
 static void usb_service_task(void *params) {
     (void)params;
+#ifdef USB_HID_ENABLED
+    /* USB bring-up is the very LAST act of boot: wait for the whole
+     * system to settle — netcard serial up, ESP32-C6 boot chatter done,
+     * chime played, desktop composited — then init, recompute dividers
+     * against the final clock, and power-cycle the hub so enumeration
+     * runs in a quiet machine. */
+    {
+        extern void usbhid_start_enumeration(void);
+        vTaskDelay(pdMS_TO_TICKS(5000));
+        printf("[USB] system settled — starting USB host bring-up\n");
+        stdio_flush();
+        usbhid_init();
+        usbhid_start_enumeration();
+        /* HID mount messages follow as devices enumerate; console
+         * silence after them means "running". */
+    }
+#endif
     for (;;) {
 #ifdef USB_HID_ENABLED
-        tuh_task();
+        usbhid_task();   /* TinyUSB host service */
 #else
         tud_task();
 #endif
@@ -420,6 +438,11 @@ static void compositor_task(void *params) {
         /* End boot sequence: show taskbar and hide cursor */
         if (boot_cursor_active && xTaskGetTickCount() >= boot_deadline) {
             boot_cursor_active = false;
+            /* Boot status recap — printed from a task so it survives the
+             * CDC drops that eat pre-scheduler boot output. */
+            printf("[BOOT] SD card: %s", sdcard_is_mounted() ? "mounted" : "FAILED");
+            if (!sdcard_is_mounted()) printf(" (FatFs err %d)", sdcard_last_error());
+            printf("  |  audio DAC: %s\n", tlv320dac3100_ok() ? "ok" : "FAILED");
             swap_init();
             startmenu_init();
             file_assoc_scan();
@@ -432,6 +455,7 @@ static void compositor_task(void *params) {
             /* Focus desktop if shortcuts exist and no windows are open */
             if (desktop_has_shortcuts()) desktop_focus();
             startup_app_launch();
+            printf("[BOOT] desktop ready\n");
         }
 
         /* Process deferred swap resumes — an exiting app sets a flag,
@@ -927,21 +951,10 @@ static void input_task(void *params) {
              * hit-testing, focus management, and title-bar dragging */
             wm_handle_mouse_input(WM_MOUSEMOVE, cur_x, cur_y, buttons);
 
-            /* Hide cursor over client area of WF_HIDE_CURSOR windows */
-            {
-                bool hide = false;
-                hwnd_t hover = wm_window_at_point(cur_x, cur_y);
-                if (hover != HWND_NULL) {
-                    window_t *hw = wm_get_window(hover);
-                    if (hw && (hw->flags & WF_HIDE_CURSOR)) {
-                        uint8_t zone = theme_hit_test(&hw->frame,
-                                                      hw->flags,
-                                                      cur_x, cur_y);
-                        if (zone == HT_CLIENT) hide = true;
-                    }
-                }
-                cursor_set_visible(!hide);
-            }
+            /* Hide cursor over client area of WF_HIDE_CURSOR windows.
+             * Also re-run by the WM when windows appear/vanish under a
+             * stationary pointer (wm_refresh_cursor_hide in window.c). */
+            wm_refresh_cursor_hide();
 
             /* Detect button transitions */
             uint8_t changed = buttons ^ prev_buttons;
@@ -1005,16 +1018,21 @@ static void __no_inline_not_in_flash_func(set_flash_timings)(int cpu_mhz) {
 }
 
 int main(void) {
-#if CPU_CLOCK_MHZ > 252
+#if CPU_CLOCK_MHZ > 252 && !defined(FRANK_BOARD_FRUITJAM)
     vreg_disable_voltage_limit();
     vreg_set_voltage(CPU_VOLTAGE);
     set_flash_timings(CPU_CLOCK_MHZ);
     sleep_ms(100);
 #endif
 
+#ifndef FRANK_BOARD_FRUITJAM
     if (!set_sys_clock_khz(CPU_CLOCK_MHZ * 1000, false)) {
         set_sys_clock_khz(252 * 1000, true);
     }
+#else
+    /* Fruit Jam boots at the SDK default clock; DispHSTX raises it to the
+     * video-mode clock (252 MHz for 640x480) during display_init. */
+#endif
 
     /* ATRANS3: With 16MB flash, 0x10FFF000 maps directly to flash 0xFFF000.
      * Set identity mapping for the top 4MB window (0x10C00000–0x10FFFFFF
@@ -1049,15 +1067,27 @@ int main(void) {
         ram_vector_table[15] = (uint32_t)(uintptr_t)isr_systick;
     }
 
+#ifdef FRANK_BOARD_FRUITJAM
+    /* Power the USB-A jacks (CH334F hub) as early as possible — mirrors
+     * arduino-pico's initVariant(), which drives PIN_5V_EN=11 high at
+     * startup. The hub then has seconds to power up and settle before the
+     * USB host stack starts. */
+    gpio_init(USB_HOST_5V_PIN);
+    gpio_put(USB_HOST_5V_PIN, 1);
+    gpio_set_dir(USB_HOST_5V_PIN, GPIO_OUT);
+#endif
+
     stdio_init_all();
 #if LIB_PICO_STDIO_USB
-    /* Dev builds (USB_HID=0): USB CDC is the stdio sink. Wait until the
-     * host terminal opens the port, then sleep 3 s before any printf fires,
-     * so the whole boot log lands in the console. */
-    while (!stdio_usb_connected()) {
+    /* Dev builds (USB_HID=0): USB CDC is the stdio sink. The console is
+     * optional — wait up to 3 s for a terminal to open the port, then boot
+     * regardless. If one attached, give it a moment so the boot log lands. */
+    for (int i = 0; i < 300 && !stdio_usb_connected(); i++) {
         sleep_ms(10);
     }
-    sleep_ms(3000);
+    if (stdio_usb_connected()) {
+        sleep_ms(1500);
+    }
 #endif
 
     // Check for saved HardFault info from previous crash
@@ -1076,7 +1106,6 @@ int main(void) {
     }
 
     printf("\n== FRANK OS ==\n");
-    printf("CPU: %lu MHz\n", (unsigned long)(clock_get_hz(clk_sys) / 1000000));
     printf("Scheduler: FreeRTOS\n");
 #if DISPHSTX_USE_DVI
     printf("Display: DispHSTX DVI\n");
@@ -1087,7 +1116,13 @@ int main(void) {
 
     printf("Initializing display...\n"); stdio_flush();
     display_init();
+
+    /* USB host bring-up happens as the LAST step of boot, from
+     * usb_service_task — see there. Nothing USB runs here. */
     printf("Display initialized\n"); stdio_flush();
+    /* DispHSTX re-clocks the system to the video-mode rate during
+     * display_init, so only now does clk_sys read its final value. */
+    printf("CPU: %lu MHz\n", (unsigned long)(clock_get_hz(clk_sys) / 1000000));
 
     /* Initialize PSRAM (if HW init is compiled in) and probe size */
 #ifdef PSRAM_MAX_FREQ_MHZ
@@ -1099,6 +1134,12 @@ int main(void) {
     printf("PSRAM: %u KB\n", psram_detected_bytes() / 1024);
     stdio_flush();
 
+#ifdef FRANK_BOARD_FRUITJAM
+    /* No native PS/2 on Fruit Jam and PIO0/PIO1 are reserved exclusively
+     * for the PIO-USB host (it assumes sole ownership) — input is USB HID. */
+    printf("PS/2 skipped (Fruit Jam: USB HID input, PIO0/1 reserved for USB)\n");
+    stdio_flush();
+#else
     printf("Initializing PS/2 (unified driver)...\n"); stdio_flush();
     if (ps2_init(pio0, PS2_PIN_CLK, PS2_MOUSE_CLK)) {
         printf("PS/2 PIO initialized (kbd CLK=%d, mouse CLK=%d)\n",
@@ -1119,6 +1160,7 @@ int main(void) {
     } else {
         printf("PS/2 PIO init failed\n");
     }
+#endif /* FRANK_BOARD_FRUITJAM */
     stdio_flush();
 
     wm_init();
@@ -1171,10 +1213,9 @@ int main(void) {
     /* One-shot composite: desktop + hourglass, no taskbar yet */
     wm_composite();
 
-#ifdef USB_HID_ENABLED
-    printf("Initializing USB HID Host...\n"); stdio_flush();
-    usbhid_init();
-#endif
+    /* USB HID host bring-up is deferred into usb_service_task (runs a few
+     * seconds after boot) so a host-stack fault can't take the boot down
+     * and its diagnostics land on a live console. */
 
 #ifdef USB_HID_ENABLED
     xTaskCreate(usb_service_task, "usb", 512, NULL, configMAX_PRIORITIES - 1, NULL);
