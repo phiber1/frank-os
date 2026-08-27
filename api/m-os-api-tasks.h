@@ -66,6 +66,20 @@ typedef portSTACK_TYPE   StackType_t;
 typedef int32_t          BaseType_t;
 typedef uint32_t         UBaseType_t;
 
+/* Apps do not define configTICK_TYPE_WIDTH_IN_BITS, and an undefined
+ * macro evaluates to 0 in #if — which silently selected the 16-BIT
+ * TickType_t below while the OS kernel runs 32-bit ticks.  Result:
+ * every app timeout comparison broke when the tick count crossed
+ * 65536 (~131s of uptime), and portMAX_DELAY (0xFFFF) turned "wait
+ * forever" into 131 seconds.  Default to the kernel's 32-bit width. */
+#ifndef TICK_TYPE_WIDTH_16_BITS
+    #define TICK_TYPE_WIDTH_16_BITS    0
+    #define TICK_TYPE_WIDTH_32_BITS    1
+#endif
+#ifndef configTICK_TYPE_WIDTH_IN_BITS
+    #define configTICK_TYPE_WIDTH_IN_BITS    TICK_TYPE_WIDTH_32_BITS
+#endif
+
 #if ( configTICK_TYPE_WIDTH_IN_BITS == TICK_TYPE_WIDTH_16_BITS )
     typedef uint16_t     TickType_t;
     #define portMAX_DELAY              ( TickType_t ) 0xffff

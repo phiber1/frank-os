@@ -153,3 +153,17 @@ unsigned long long __aeabi_uldivmod(unsigned long long x, unsigned long long y) 
     typedef unsigned long long (*fn)(unsigned long long, unsigned long long);
     return ((fn)_sys_table_ptrs[264])(x, y);
 }
+/* Signed variant via the unsigned OS helper.  Like __aeabi_uldivmod
+ * above, this returns the quotient only (r0:r1) — sufficient for '/',
+ * which is all the apps generate.  Needed because GCC can emit the
+ * undefined symbol even for signed 64-bit divisions it later folds,
+ * and the app loader rejects any undefined symbol. */
+__attribute__((weak))
+long long __aeabi_ldivmod(long long x, long long y) {
+    typedef unsigned long long (*fn)(unsigned long long, unsigned long long);
+    int neg = (x < 0) ^ (y < 0);
+    unsigned long long ux = (x < 0) ? (unsigned long long)-x : (unsigned long long)x;
+    unsigned long long uy = (y < 0) ? (unsigned long long)-y : (unsigned long long)y;
+    unsigned long long q = ((fn)_sys_table_ptrs[264])(ux, uy);
+    return neg ? -(long long)q : (long long)q;
+}
