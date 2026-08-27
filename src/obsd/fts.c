@@ -34,7 +34,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <fts.h>
-#include <unistd.h>>
+#include <unistd.h>
 #include "sys_table.h"
 #include "cmd.h"
 

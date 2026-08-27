@@ -10,8 +10,15 @@
 #include "sys_table.h"
 
 /* Some useful macros */
+#ifndef NL_ARGMAX
+#define NL_ARGMAX 9
+#endif
+
 #ifndef MAX
 #define MAX(a,b) ((a)>(b) ? (a) : (b))
+#endif
+
+#ifndef MIN
 #define MIN(a,b) ((a)<(b) ? (a) : (b))
 #endif
 
