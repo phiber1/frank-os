@@ -82,17 +82,27 @@ void i2s_init(i2s_config_t *config) {
     audio_pio = config->pio;
     dma_transfer_count = config->dma_trans_count;
 
-    /* Full hardware reset of PIO1 (PS/2 uses PIO0, HSTX is separate) */
+#ifndef FRANK_BOARD_FRUITJAM
+    /* Full hardware reset of PIO1 (M2: PIO1 is exclusively audio's;
+     * PS/2 uses PIO0, HSTX is separate). Never do this on Fruit Jam:
+     * audio lives on PIO2 there (shared with the netcard UART, so no
+     * block reset is safe), and PIO1 belongs to PIO-USB — resetting it
+     * mid-boot wipes the USB RX decoder's SHIFTCTRL/PINCTRL behind the
+     * host stack's back and silently blinds enumeration. */
     reset_block(RESETS_RESET_PIO1_BITS);
     unreset_block_wait(RESETS_RESET_PIO1_BITS);
+#endif
 
     /* Clear audio DMA IRQ flags */
     dma_hw->ints0 = (1u << AUDIO_DMA_CH_A) | (1u << AUDIO_DMA_CH_B);
 
-    /* Configure GPIO pins for PIO1 */
-    gpio_set_function(config->data_pin, GPIO_FUNC_PIO1);
-    gpio_set_function(config->clock_pin_base, GPIO_FUNC_PIO1);
-    gpio_set_function(config->clock_pin_base + 1, GPIO_FUNC_PIO1);
+    /* Configure GPIO pins for whichever PIO instance we run on */
+    gpio_function_t pio_fn = (config->pio == pio0) ? GPIO_FUNC_PIO0 :
+                             (config->pio == pio1) ? GPIO_FUNC_PIO1 :
+                                                     GPIO_FUNC_PIO2;
+    gpio_set_function(config->data_pin, pio_fn);
+    gpio_set_function(config->clock_pin_base, pio_fn);
+    gpio_set_function(config->clock_pin_base + 1, pio_fn);
 
     gpio_set_drive_strength(config->data_pin, GPIO_DRIVE_STRENGTH_12MA);
     gpio_set_drive_strength(config->clock_pin_base, GPIO_DRIVE_STRENGTH_12MA);
