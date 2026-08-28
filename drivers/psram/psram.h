@@ -38,6 +38,10 @@ void psram_free(void *ptr);
 /* Returns true if PSRAM was detected and the allocator is active. */
 bool psram_is_available(void);
 
+/* Debug: validate the free list and print a one-line summary (or a
+ * corruption report).  Normal task context only. */
+void psram_check(const char *tag);
+
 /* Returns total detected PSRAM in bytes (cached after first probe). */
 unsigned int psram_detected_bytes(void);
 

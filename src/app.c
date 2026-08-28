@@ -302,6 +302,28 @@ void __in_hfa() resolve_thm_pc22(uint16_t* addr, uint16_t* addr_ref, uint32_t sy
     *addr++ = 0xF000 | (S << 10) | imm10;
     *addr = (0b11010 << 11) | (J1 << 13) | (J2 << 11) | imm11;
     //goutf("%04X %04X -> %04X %04X [%p]\n" , instr0, instr, *(addr-1), *addr, addr - 1);
+
+    /* TEMP DIAG (wedge hunt): decode the patched BL back and verify it
+     * lands on the symbol.  A mispatched branch here becomes a silent
+     * full-OS wedge at first execution — catch it at load time instead. */
+    {
+        uint16_t hi = *(addr - 1), lo = *addr;
+        uint32_t vS  = (hi >> 10) & 1;
+        uint32_t vJ1 = (lo >> 13) & 1, vJ2 = (lo >> 11) & 1;
+        uint32_t vI1 = (~(vJ1 ^ vS)) & 1, vI2 = (~(vJ2 ^ vS)) & 1;
+        uint32_t voff = (vI1 << 23) | (vI2 << 22) |
+                        ((uint32_t)(hi & 0x3FF) << 12) |
+                        ((uint32_t)(lo & 0x7FF) << 1);
+        if (vS) voff |= 0xFE000000;  /* sign-extend 25-bit */
+        uint32_t target = (uint32_t)addr_ref + 4 + voff;
+        uint32_t want   = sym_val & ~1u;
+        if (target != want) {
+            static int bl_mispatch_count;
+            if (bl_mispatch_count++ < 20)
+                goutf("[reloc] BL MISPATCH @%p: lands %ph want %ph (off %ph)\n",
+                      addr_ref, target, want, new_offset);
+        }
+    }
 }
 
 // Разрешение ссылки типа R_ARM_THM_JUMP24 (B.W в Thumb-2)
@@ -340,6 +362,26 @@ static void __in_hfa() resolve_thm_jump24(uint16_t* addr, uint16_t* addr_ref, ui
     // B.W encoding: upper = 11110 S imm10, lower = 10 J1 1 J2 imm11
     addr[0] = (uint16_t)(0xF000 | (S << 10) | imm10);
     addr[1] = (uint16_t)(0x9000 | (J1 << 13) | (J2 << 11) | imm11);
+
+    /* TEMP DIAG (wedge hunt): verify the patched B.W lands on the symbol. */
+    {
+        uint16_t hi = addr[0], lo = addr[1];
+        uint32_t vS  = (hi >> 10) & 1;
+        uint32_t vJ1 = (lo >> 13) & 1, vJ2 = (lo >> 11) & 1;
+        uint32_t vI1 = (~(vJ1 ^ vS)) & 1, vI2 = (~(vJ2 ^ vS)) & 1;
+        uint32_t voff = (vI1 << 23) | (vI2 << 22) |
+                        ((uint32_t)(hi & 0x3FF) << 12) |
+                        ((uint32_t)(lo & 0x7FF) << 1);
+        if (vS) voff |= 0xFE000000;
+        uint32_t target = (uint32_t)addr_ref + 4 + voff;
+        uint32_t want   = sym_val & ~1u;
+        if (target != want) {
+            static int bw_mispatch_count;
+            if (bw_mispatch_count++ < 20)
+                goutf("[reloc] B.W MISPATCH @%p: lands %ph want %ph (off %ph)\n",
+                      addr_ref, target, want, new_offset);
+        }
+    }
 }
 
 // Разрешение ссылки типа R_ARM_THM_JUMP19 (B<cond>.W в Thumb-2)
@@ -1352,6 +1394,7 @@ void __in_hfa() exec_sync(cmd_ctx_t* ctx) {
     goutf("EXEC ctx->argc: %d\n", ctx->argc);
     #endif
     bootb_sync_signal = bootb_ctx->sig_fn;
+    psram_check("app-loaded");
     int res = bootb_ctx->main_fn ? bootb_ctx->main_fn(ctx->argc, ctx->argv) : -3;
     bootb_sync_signal = NULL;
     #if DEBUG_APP_LOAD

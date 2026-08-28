@@ -106,6 +106,31 @@ void psram_heap_init(void) {
     free_list = blk;
 }
 
+/* Corruption diagnostics captured inside the suspended-scheduler window
+ * and reported AFTER xTaskResumeAll() — printf under vTaskSuspendAll
+ * deadlocks (stdio needs the scheduler), which turns a detected
+ * corruption into a silent hard wedge. */
+static block_hdr_t *corrupt_node;
+static const char  *corrupt_why;
+static block_hdr_t  corrupt_copy;   /* snapshot (node may be unreadable) */
+
+static inline bool node_in_range(const block_hdr_t *b) {
+    uintptr_t a = (uintptr_t)b;
+    return a >= PSRAM_BASE && a + HDR_SIZE <= PSRAM_BASE + detected_size &&
+           ((a & 3) == 0);
+}
+
+static void report_corruption(const char *who) {
+    if (!corrupt_node)
+        return;
+    printf("[%s] CORRUPT free list: %s @%p", who, corrupt_why, corrupt_node);
+    if (node_in_range(corrupt_node))
+        printf(" {size=%u next=%p}", (unsigned)corrupt_copy.size,
+               corrupt_copy.next);
+    printf("\n");
+    corrupt_node = NULL;
+}
+
 void *psram_alloc(size_t size) {
     if (!free_list || size == 0)
         return NULL;
@@ -124,8 +149,13 @@ void *psram_alloc(size_t size) {
     const int max_steps = (int)(detected_size / MIN_BLOCK);
 
     while (cur) {
+        if (!node_in_range(cur)) {
+            corrupt_node = cur; corrupt_why = "node out of range";
+            break;
+        }
         if (++steps > max_steps) {
-            printf("[psram_alloc] CORRUPT free list at %p, %d steps\n", cur, steps);
+            corrupt_node = cur; corrupt_why = "walk too long (cycle?)";
+            corrupt_copy = *cur;
             break;
         }
         if (cur->size >= size) {
@@ -148,7 +178,56 @@ void *psram_alloc(size_t size) {
     }
 
     (void)xTaskResumeAll();
+    report_corruption("psram_alloc");
     return result;
+}
+
+/* Bounded validation sweep of the free list; prints a one-line summary
+ * (or a corruption report) via printf.  Call from normal task context
+ * only — never with the scheduler suspended. */
+void psram_check(const char *tag) {
+    if (!detected_size) {
+        printf("[psram] %s: not available\n", tag);
+        return;
+    }
+    int n = 0;
+    size_t total = 0, largest = 0;
+    block_hdr_t *prev = NULL;
+    const char *why = NULL;
+    block_hdr_t *bad = NULL;
+    block_hdr_t bad_copy = {0, NULL};
+
+    vTaskSuspendAll();
+    block_hdr_t *cur = free_list;
+    while (cur) {
+        if (!node_in_range(cur))                 { bad = cur; why = "node out of range"; break; }
+        bad_copy = *cur;
+        if (cur->size > detected_size)           { bad = cur; why = "size insane"; break; }
+        if ((uintptr_t)cur + HDR_SIZE + cur->size > PSRAM_BASE + detected_size)
+                                                 { bad = cur; why = "extends past end"; break; }
+        if (prev && cur <= prev)                 { bad = cur; why = "order violation (cycle?)"; break; }
+        total += cur->size;
+        if (cur->size > largest) largest = cur->size;
+        if (++n > 100000)                        { bad = cur; why = "list too long (cycle?)"; break; }
+        prev = cur;
+        cur = cur->next;
+    }
+    (void)xTaskResumeAll();
+
+    if (bad) {
+        printf("[psram] %s: CORRUPT after %d blocks: %s @%p", tag, n, why, bad);
+        if (node_in_range(bad)) {
+            printf(" {size=%u next=%p} dump:", (unsigned)bad_copy.size, bad_copy.next);
+            const uint32_t *w = (const uint32_t *)bad;
+            for (int i = 0; i < 8; i++) printf(" %08X", (unsigned)w[i]);
+        }
+        if (prev)
+            printf(" prev=%p {size=%u next=%p}", prev, (unsigned)prev->size, prev->next);
+        printf("\n");
+    } else {
+        printf("[psram] %s: ok, %d free blocks, %u KB free, largest %u KB\n",
+               tag, n, (unsigned)(total >> 10), (unsigned)(largest >> 10));
+    }
 }
 
 void psram_free(void *ptr) {
@@ -181,6 +260,12 @@ void psram_free(void *ptr) {
     const int max_steps = (int)(detected_size / MIN_BLOCK);
 
     while (cur && cur < blk) {
+        if (!node_in_range(cur)) {
+            (void)xTaskResumeAll();
+            printf("[psram_free] CORRUPT node %p out of range (freeing %p)\n",
+                   cur, ptr);
+            return;
+        }
         if (++steps > max_steps) {
             /* Free list is corrupted — break to avoid infinite loop */
             (void)xTaskResumeAll();
