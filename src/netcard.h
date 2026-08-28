@@ -48,6 +48,10 @@ bool netcard_resolve(const char *hostname, char *ip_out, int ip_out_size);
 /* TCP ping — returns connect latency in ms, or -1 on failure */
 int  netcard_ping(const char *host, uint16_t port);
 
+/* Snap the current blocking command wait (connect, resolve, ...) out of
+ * its poll loop from another task; the command returns as a timeout. */
+void netcard_abort(void);
+
 /* Sockets (ids 0-3) */
 bool netcard_socket_open(uint8_t id, bool tls, const char *host, uint16_t port);
 bool netcard_socket_send(uint8_t id, const uint8_t *data, uint16_t len);

@@ -53,6 +53,13 @@ static inline bool netcard_socket_open(uint8_t id, bool tls,
     return ((fn_t)_sys_table_ptrs[540])(id, tls, host, port);
 }
 
+static inline void netcard_abort_wait(void) {
+    /* Slot 555 is absent (0) on older OS builds — guard before calling. */
+    typedef void (*fn_t)(void);
+    if (_sys_table_ptrs[555])
+        ((fn_t)_sys_table_ptrs[555])();
+}
+
 static inline bool netcard_socket_send(uint8_t id, const uint8_t *d, uint16_t n) {
     typedef bool (*fn_t)(uint8_t, const uint8_t *, uint16_t);
     return ((fn_t)_sys_table_ptrs[541])(id, d, n);
@@ -449,7 +456,7 @@ static void do_get(void) {
     snprintf(line, sizeof(line), "Connecting to %s:%d...", host, port);
     get_status(line);
     if (!netcard_socket_open(GET_SOCK_ID, false, host, (uint16_t)port)) {
-        get_status("Connect failed");
+        get_status(g_abort ? "Aborted" : "Connect failed");
         goto out_nofile;
     }
     {
@@ -743,6 +750,7 @@ static bool app_event(hwnd_t hwnd, const window_event_t *ev) {
             my >= BTN_Y && my < BTN_Y + BTN_H) {
             if (app.busy && app.tab == TAB_GET) {
                 g_abort = true;                    /* Stop */
+                netcard_abort_wait();              /* snap a blocking connect */
                 xTaskNotifyGive(app_task);
             } else if (!app.busy && textarea_get_length(&app.input_ta) > 0) {
                 g_go = true;
@@ -773,6 +781,7 @@ static bool app_event(hwnd_t hwnd, const window_event_t *ev) {
         }
         if (sc == 0x29 && app.busy && app.tab == TAB_GET) {
             g_abort = true;
+            netcard_abort_wait();              /* snap a blocking connect */
             xTaskNotifyGive(app_task);
             return true;
         }

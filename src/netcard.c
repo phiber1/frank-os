@@ -406,10 +406,23 @@ static void netcard_poll_locked(void) {
 /* Blocking helpers — wait for a specific command response                     */
 /* -------------------------------------------------------------------------- */
 
+/* Set from another task (e.g. an app's Stop button) to snap the current
+ * blocking command wait out of its poll loop.  Cleared at the start of
+ * every command so a stale abort can't kill the next one. */
+static volatile bool nc_abort_req;
+
+void netcard_abort(void) {
+    nc_abort_req = true;
+}
+
 static nc_resp_t nc_wait_response(uint32_t timeout_ms) {
     TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(timeout_ms);
 
     while (cmd_response == NC_RESP_NONE) {
+        if (nc_abort_req) {
+            nc_abort_req = false;
+            return NC_RESP_NONE;   /* caller sees a timeout */
+        }
         if (xTaskGetTickCount() >= deadline)
             return NC_RESP_NONE;
 
@@ -425,6 +438,7 @@ static nc_resp_t nc_wait_response(uint32_t timeout_ms) {
 static bool nc_send_and_wait(const char *cmd, uint32_t timeout_ms) {
     netcard_poll();
 
+    nc_abort_req = false;
     cmd_response = NC_RESP_NONE;
 
     printf("[NC] >> %s\n", cmd);
