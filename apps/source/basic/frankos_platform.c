@@ -170,84 +170,6 @@ static uint8_t *basic_flash_to_ram(uint32_t flash_offs)
     return g_basic_prog_buf;
 }
 
-/* ═════════════════════════════════════════════════════════════════════════
- * Draw.c globals (declared extern in Draw.h; defined here instead of Draw.c)
- * ═════════════════════════════════════════════════════════════════════════ */
-
-short           gui_font            = 0x11;  /* font 1, scale 1 */
-short           gui_font_width      = 8;
-short           gui_font_height     = 16;
-int             gui_fcolour         = 0xFFFFFF;
-int             gui_bcolour         = 0x000000;
-unsigned char  *FontTable[FONT_TABLE_SIZE]; /* font 0 set in basic_platform_init */
-
-short           DisplayHRes         = 632;
-short           DisplayVRes         = 384;
-short           HRes                = 632;
-short           VRes                = 384;
-volatile short  low_x               = 0;
-volatile short  high_x              = 631;
-volatile short  low_y               = 0;
-volatile short  high_y              = 383;
-short           CurrentX            = 0;
-short           CurrentY            = 0;
-int             PrintPixelMode      = 0;
-char            CMM1                = 0;
-int             ScreenSize          = 0;
-
-struct D3D     *struct3d[MAX3D + 1];
-s_camera        camera[MAXCAM + 1];
-struct spritebuffer *spritebuff[MAXBLITBUF + 1];
-struct blitbuffer    blitbuff[MAXBLITBUF + 1];
-struct stobject      stobjects[MAXSTOBJECTS + 1];
-
-char  *COLLISIONInterrupt   = NULL;
-bool   CollisionFound       = false;
-char  *STCollisionInterrupt = NULL;
-bool   STCollisionFound     = false;
-int    sprite_hit_st        = 0;
-int    st_which_collided    = 0;
-uint8_t sprite_transparent  = 0;
-int    RGB121map[16];
-bool   mergerunning         = false;
-uint32_t mergetimer         = 0;
-bool   mergedread           = false;
-
-/* Draw function pointers — point to safe no-op stubs so indirect calls
- * through these pointers (e.g. in MX470Display / Editor.c) don't crash. */
-static void nop_DrawPixel(int x, int y, int c) { (void)x;(void)y;(void)c; }
-static void real_DrawRectangle(int x1,int y1,int x2,int y2,int c)
-{
-    extern uint8_t basic_rgb2cga(int rgb);
-    extern void basic_tbuf_fill_cells(int r0, int c0, int r1, int c1,
-                                      uint8_t attr);
-    /* Keep the current fg colour in the cleared cells: an fg==bg cell
-     * makes the inverse-video cursor invisible. */
-    uint8_t bg = basic_rgb2cga(c);
-    uint8_t fg = basic_rgb2cga(gui_fcolour);
-    if (fg == bg) fg = (uint8_t)(bg ^ 0x07);
-    basic_tbuf_fill_cells(y1 / 16, x1 / 8, y2 / 16, x2 / 8,
-                          (uint8_t)((bg << 4) | fg));
-}
-static void nop_DrawRectangle(int x1,int y1,int x2,int y2,int c)
-{ (void)x1;(void)y1;(void)x2;(void)y2;(void)c; }
-static void nop_DrawBitmap(int x1,int y1,int w,int h,int s,int fc,int bc,unsigned char *bm)
-{ (void)x1;(void)y1;(void)w;(void)h;(void)s;(void)fc;(void)bc;(void)bm; }
-static void nop_ScrollLCD(int n) { (void)n; }
-static void nop_DrawBuffer(int x1,int y1,int x2,int y2,unsigned char *c)
-{ (void)x1;(void)y1;(void)x2;(void)y2;(void)c; }
-static void nop_ReadBuffer(int x1,int y1,int x2,int y2,unsigned char *c)
-{ (void)x1;(void)y1;(void)x2;(void)y2;(void)c; }
-
-void (*DrawPixel)(int, int, int)                      = nop_DrawPixel;
-void (*DrawRectangle)(int, int, int, int, int)        = real_DrawRectangle;
-void (*DrawBitmap)(int,int,int,int,int,int,int,unsigned char*) = nop_DrawBitmap;
-void (*ScrollLCD)(int)                                = nop_ScrollLCD;
-void (*DrawBuffer)(int,int,int,int,unsigned char*)    = nop_DrawBuffer;
-void (*ReadBuffer)(int,int,int,int,unsigned char*)    = nop_ReadBuffer;
-void (*DrawBLITBuffer)(int,int,int,int,unsigned char*)= nop_DrawBuffer;
-void (*ReadBLITBuffer)(int,int,int,int,unsigned char*)= nop_ReadBuffer;
-void (*ReadBufferFast)(int,int,int,int,unsigned char*)= nop_ReadBuffer;
 
 /* ═════════════════════════════════════════════════════════════════════════
  * Draw.c stub functions
@@ -262,15 +184,7 @@ void DisplayPutC(char c)
     basic_textbuf_putc((unsigned char)c);
 }
 
-void ClearScreen(int c)
-{
-    (void)c;
-    /* Delegate to frankos_main.c which has the correct g_textbuf type. */
-    extern void basic_tbuf_clear(void);
-    basic_tbuf_clear();
-    CurrentX = 0;
-    CurrentY = 0;
-}
+
 
 void ShowCursor(int show)
 {
@@ -279,97 +193,41 @@ void ShowCursor(int show)
     /* Cursor visible state is controlled by the blink timer in frankos_main.c. */
 }
 
-void CheckDisplay(void)     { }
-void ResetDisplay(void)     { }
 void setmode(int m, bool c) { (void)m; (void)c; }
 
-void SetFont(int fnt)
-{
-    gui_font        = (short)fnt;
-    gui_font_width  = GetFontWidth(fnt);
-    gui_font_height = GetFontHeight(fnt);
-}
 
-int GetFontWidth(int fnt)
-{
-    (void)fnt;
-    return 8;   /* Only font 0 (8×16) is available in this port. */
-}
 
-int GetFontHeight(int fnt)
-{
-    (void)fnt;
-    return 16;
-}
 
-void initFonts(void)
-{
-    memset(FontTable, 0, sizeof(FontTable));
-    /* Font 0 is the built-in 8×16 terminal font; no external font data needed. */
-}
 
-void GUIPrintString(int x, int y, int fnt, int jh, int jv, int jo,
-                    int fc, int bc, char *str)
-{
-    (void)x; (void)y; (void)fnt; (void)jh; (void)jv; (void)jo;
-    (void)fc; (void)bc;
-    /* Print to console terminal as a fallback. */
-    while (str && *str)
-        basic_textbuf_putc((unsigned char)*str++);
-}
+void copybuffertoscreen(int a,int b,int c,int d,int e)
+{ (void)a;(void)b;(void)c;(void)d;(void)e; }
 
-int GetJustification(char *p, int *jh, int *jv, int *jo)
+/* Cell-space clear for the EDITOR's region erases (MX470Display in
+ * Editor.c).  The editor's clears must hit the TEXT CELL grid, not the
+ * pixel graphics layer that Draw.c's DrawBox/DrawRectangle now target. */
+void basic_cellclear_px(int x1, int y1, int x2, int y2, int rgb)
 {
-    (void)p; if (jh) *jh = 0; if (jv) *jv = 0; if (jo) *jo = 0;
-    return 0;
-}
-
-void DrawLine(int x1,int y1,int x2,int y2,int w,int c)
-{ (void)x1;(void)y1;(void)x2;(void)y2;(void)w;(void)c; }
-void DrawBox(int x1,int y1,int x2,int y2,int w,int c,int fill)
-{
-    /* Editor/display-console clears regions with DrawBox; render it as
-     * a text-cell fill (background colour) in the terminal buffer. */
-    (void)w; (void)c;
     extern uint8_t basic_rgb2cga(int rgb);
     extern void basic_tbuf_fill_cells(int r0, int c0, int r1, int c1,
                                       uint8_t attr);
-    int c0 = x1 / 8,  r0 = y1 / 16;
-    int c1 = x2 / 8,  r1 = y2 / 16;
-    uint8_t bg = basic_rgb2cga(fill);
-    uint8_t fg = basic_rgb2cga(gui_fcolour);
-    if (fg == bg) fg = (uint8_t)(bg ^ 0x07);   /* keep cursor inversion visible */
-    basic_tbuf_fill_cells(r0, c0, r1, c1, (uint8_t)((bg << 4) | fg));
+    extern int gui_fcolour;
+    uint8_t bg = basic_rgb2cga(rgb);
+    uint8_t attr;
+    if (bg == 0) {
+        /* Clearing to the default (black) background: write DEFAULT_ATTR
+         * cells, identical to tbuf_clear's.  Any other attr makes the
+         * cells OPAQUE to basic_paint's graphics compositing — the
+         * up-arrow history redraw's CLEAR_TO_EOS was carpeting the
+         * window with 0x0F cells and hiding the graphics layer. */
+        attr = 0x07;   /* DEFAULT_ATTR */
+    } else {
+        uint8_t fg = basic_rgb2cga(gui_fcolour);
+        if (fg == bg) fg = (uint8_t)(bg ^ 0x07);
+        attr = (uint8_t)((bg << 4) | fg);
+    }
+    basic_tbuf_fill_cells(y1 / 16, x1 / 8, y2 / 16, x2 / 8, attr);
 }
-void DrawRBox(int x1,int y1,int x2,int y2,int r,int c,int fill)
-{ (void)x1;(void)y1;(void)x2;(void)y2;(void)r;(void)c;(void)fill; }
-void DrawCircle(int x,int y,int r,int w,int c,int fill,MMFLOAT aspect)
-{ (void)x;(void)y;(void)r;(void)w;(void)c;(void)fill;(void)aspect; }
-void DrawTriangle(int x0,int y0,int x1,int y1,int x2,int y2,int c,int fill)
-{ (void)x0;(void)y0;(void)x1;(void)y1;(void)x2;(void)y2;(void)c;(void)fill; }
-void DrawPixelNormal(int x,int y,int c) { (void)x;(void)y;(void)c; }
-void ReadBuffer2(int x1,int y1,int x2,int y2,unsigned char *c)
-{ (void)x1;(void)y1;(void)x2;(void)y2;(void)c; }
-void copyframetoscreen(uint8_t *s,int x1,int x2,int y1,int y2,int odd)
-{ (void)s;(void)x1;(void)x2;(void)y1;(void)y2;(void)odd; }
-void copybuffertoscreen(int a,int b,int c,int d,int e)
-{ (void)a;(void)b;(void)c;(void)d;(void)e; }
-void restorepanel(void)     { }
-void InitDisplayVirtual(void) { }
-void ConfigDisplayVirtual(unsigned char *p) { (void)p; }
-void merge(uint8_t colour)  { (void)colour; }
-void blitmerge(int x0,int y0,int w,int h,uint8_t colour)
-{ (void)x0;(void)y0;(void)w;(void)h;(void)colour; }
-void DrawRectangleUser(int x1,int y1,int x2,int y2,int c)
-{ (void)x1;(void)y1;(void)x2;(void)y2;(void)c; }
-void DrawBitmapUser(int x1,int y1,int w,int h,int s,int fc,int bc,unsigned char *bm)
-{ (void)x1;(void)y1;(void)w;(void)h;(void)s;(void)fc;(void)bc;(void)bm; }
-void closeall3d(void)            { }
-void closeallsprites(void)       { }
-void closeallstobjects(void)     { }
-void closeframebuffer(char layer){ (void)layer; }
-int  rgb(int r,int g,int b)      { return (r<<16)|(g<<8)|b; }
-int  getColour(char *c, int minus){ (void)c;(void)minus; return 0; }
+
 
 /* ═════════════════════════════════════════════════════════════════════════
  * Keyboard / console stubs (not part of Draw.c, but needed here)
@@ -684,6 +542,20 @@ void basic_platform_init(void)
     serial_dbg("[basic] starting tick timer\n");
     basic_start_tick_timer();
     serial_dbg("[basic] platform_init done\n");
+    /* Pixel graphics layer: buffer, 8x16 font as PicoMite font 1,
+     * geometry, and Draw.c function-pointer installation. */
+    {
+        extern void basic_gfx_init(void);
+        basic_gfx_init();
+        /* Any later ResetDisplay() re-runs SetFont(Option.DefaultFont);
+         * the console geometry requires the 8x16 font (ours, slot 1). */
+        Option.DefaultFont = 0x11;
+        PromptFont = 0x11;
+        Option.DefaultFC = 0xFFFFFF;
+        Option.DefaultBC = 0x000000;
+    }
+    serial_dbg("[basic] gfx block done\n");
+
 }
 
 /* ═════════════════════════════════════════════════════════════════════════
@@ -712,6 +584,16 @@ reset:
     Option.NoScroll        = 1;   /* ScrollLCD is a stub — force the
                                      editor's redraw-instead-of-scroll */
     Option.CPU_Speed       = 150000;
+
+    /* ResetOptions() reset DefaultFont to the stock 8x12-class font 0.
+     * The console/editor geometry requires the 8x16 font (ours, slot 1):
+     * with gui_font_height 12, ENTER advances CurrentY by 12 while paint
+     * divides by 16 — cursor pinned to row 0, status line off-grid.
+     * Re-pin BEFORE SaveOptions below so error()'s LoadOptions +
+     * SetFont(PromptFont) reload 0x11, not the factory font. */
+    Option.DefaultFont = 0x11;
+    PromptFont         = 0x11;
+    SetFont(0x11);
 
     /* B: (the OS-managed SD card) is the default — and only — drive.
      * A: has no physical backing and errors out in drivecheck().

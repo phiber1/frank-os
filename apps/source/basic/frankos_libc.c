@@ -723,7 +723,6 @@ volatile int nunfoundc            = 0;
 void *nunstruct                   = NULL;
 
 /* MMBasic colour table (needed by some display routines) */
-unsigned int colours[16]          = {0};
 
 /* Camera */
 void cameraclose(void)            { }
@@ -801,37 +800,12 @@ int lfs_unmount(void *l)                          { (void)l; return -1; }
  * ══════════════════════════════════════════════════════════════════════════ */
 
 /* ── Display / graphics commands (stub: BASIC command handlers) ─────────── */
-void cmd_3D(void)        {}
-void cmd_arc(void)       {}
-void cmd_bezier(void)    {}
-void cmd_blit(void)      {}
-void cmd_blitmemory(void){}
-void cmd_box(void)       {}
-void cmd_circle(void)    {}
-void cmd_cls(void)       {}
-void cmd_colour(void)    {}
-void cmd_colourmap(void) {}
-void cmd_fill(void)      {}
-void cmd_font(void)      {}
-void cmd_framebuffer(void){}
-void cmd_line(void)      {}
-void cmd_pixel(void)     {}
-void cmd_polygon(void)   {}
 void cmd_pio(void)       {}
 void cmd_ray(void)       {}
-void cmd_rbox(void)      {}
-void cmd_refresh(void)   {}
 void cmd_rtc(void)       {}
-void cmd_sprite(void)    {}
-void cmd_text(void)      {}
-void cmd_triangle(void)  {}
 
 /* ── BASIC built-in functions (stub: return nothing) ────────────────────── */
-void fun_at(void)        {}
-void fun_pixel(void)     {}
 void fun_ray(void)       {}
-void fun_rgb(void)       {}
-void fun_sprite(void)    {}
 
 /* ── Colour look-up table initializers ───────────────────────────────────── */
 void init_RGB332_to_RGB565_LUT(void)    {}
@@ -876,7 +850,6 @@ void stepper_abort_to_safe_state_on_error(void) {}
 volatile int stepper_gcode_buffer_space = 0;
 
 /* ── Merge-done callback (used by some display refresh paths) ───────────── */
-void mergedone(void)     {}
 
 /* ── Pico SDK / linker symbols required by .reset handler ───────────────── */
 /* These are normally produced by the pico-sdk linker script. On Frank OS we
@@ -895,3 +868,24 @@ char __scratch_y_start__[0];
 char __scratch_y_end__[0];
 char __scratch_y_source__[0];
 
+
+/* ── get_rand_32 override ───────────────────────────────────────────────────
+ * fun_rnd (RND) and MATHS.c call pico-sdk get_rand_32(), whose pico_rand
+ * implementation takes a HARDWARE SIO spinlock and reads ROSC/TRNG entropy
+ * registers — physical resources shared with the running OS.  Executed from
+ * an app, that spins forever against the OS (silent full-system wedge, the
+ * "RUN with RND wedges the box" bug).  This object-file definition takes
+ * precedence over the SDK library member at link time, so pico_rand is
+ * never pulled in.  xorshift32 seeded from the hardware us-timer. */
+unsigned int __wrap_get_rand_32(void)
+{
+    static unsigned int s;
+    if (s == 0) {
+        s = *(volatile unsigned int *)0x400B0028u;   /* TIMERAWL */
+        if (s == 0) s = 0x6b7ddeadu;                 /* never zero */
+    }
+    s ^= s << 13;
+    s ^= s >> 17;
+    s ^= s << 5;
+    return s;
+}

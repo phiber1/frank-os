@@ -31,6 +31,10 @@
 
 #include "font.h"     /* font_8x16[4096]: 256 glyphs × 16 rows, 8 px wide */
 
+/* 632x384 4bpp graphics layer maintained by frankos_gfx.c; composited
+ * beneath the text cells (blank default-attribute cells show it). */
+extern uint8_t *basic_gfx_buf;
+
 /* ── Terminal geometry ──────────────────────────────────────────────────── */
 #define BASIC_COLS          79
 #define BASIC_ROWS          24
@@ -75,8 +79,29 @@ static TaskHandle_t       g_task    = NULL;
  * repaint storm (printScreen: ~1900 chars × ~0.5 ms = 1 s per redraw). */
 volatile bool             g_disp_dirty = false;
 
+/* ── Dirty-region tracking (cell coordinates) ───────────────────────────────
+ * Text writers and the graphics layer accumulate a bounding box; the
+ * paint renders only that region when the WM reports the frame itself
+ * was clean (sys_table[556]).  Full repaints when the window moved/was
+ * uncovered, on fullscreen toggles, and on the first paint.  This is
+ * what makes sprite animation affordable: a full composite re-reads the
+ * whole 121KB gfx layer from uncached PSRAM (~15-30 ms); a sprite frame
+ * touches a few cells. */
+#define DIRTY_MAX 4
+typedef struct { int r0, c0, r1, c1; } dirty_rect_t;
+static volatile dirty_rect_t g_dirty[DIRTY_MAX];
+static volatile int  g_dirty_n    = 0;
+static volatile bool g_force_full = true;
+
 /* Closing flag and MMAbort — also read by frankos_platform.c */
 volatile bool             g_closing = false;
+
+/* Focus state: when another window has focus, display flushes are
+ * throttled to ~4 Hz.  Repaints of an overlapped window can cascade
+ * (the WM frame-dirties higher windows over freshly painted lower
+ * ones); at 40 Hz that starved the interpreter to a standstill while
+ * e.g. Calculator sat focused on top. */
+static volatile bool      g_focused = true;
 
 /* Autorun path — set from argv[1], consumed by basic_run_interpreter() */
 char                      g_autorun_path[256];
@@ -135,6 +160,51 @@ void basic_yield(void)
  * Text buffer helpers
  * ═════════════════════════════════════════════════════════════════════════ */
 
+/* Merge-or-add into the rect list.  Disjoint dirty areas stay separate
+ * rects — a single union rect made the paint cost scale with the SPAN
+ * between two sprites, which grew as their phases drifted (the
+ * "smoothness decays over minutes, re-RUN fixes it" symptom). */
+static void mark_cells(int r0, int c0, int r1, int c1)
+{
+    if (r0 < 0) r0 = 0;
+    if (c0 < 0) c0 = 0;
+    if (r1 >= BASIC_ROWS) r1 = BASIC_ROWS - 1;
+    if (c1 >= BASIC_COLS) c1 = BASIC_COLS - 1;
+    if (r0 > r1 || c0 > c1) return;
+    int n = g_dirty_n;
+    /* merge into an overlapping/adjacent rect */
+    for (int i = 0; i < n; i++) {
+        if (r0 <= g_dirty[i].r1 + 1 && r1 >= g_dirty[i].r0 - 1 &&
+            c0 <= g_dirty[i].c1 + 1 && c1 >= g_dirty[i].c0 - 1) {
+            if (r0 < g_dirty[i].r0) g_dirty[i].r0 = r0;
+            if (c0 < g_dirty[i].c0) g_dirty[i].c0 = c0;
+            if (r1 > g_dirty[i].r1) g_dirty[i].r1 = r1;
+            if (c1 > g_dirty[i].c1) g_dirty[i].c1 = c1;
+            g_disp_dirty = true;
+            return;
+        }
+    }
+    if (n < DIRTY_MAX) {
+        g_dirty[n].r0 = r0; g_dirty[n].c0 = c0;
+        g_dirty[n].r1 = r1; g_dirty[n].c1 = c1;
+        g_dirty_n = n + 1;
+    } else {
+        /* overflow: fold into slot 0 */
+        if (r0 < g_dirty[0].r0) g_dirty[0].r0 = r0;
+        if (c0 < g_dirty[0].c0) g_dirty[0].c0 = c0;
+        if (r1 > g_dirty[0].r1) g_dirty[0].r1 = r1;
+        if (c1 > g_dirty[0].c1) g_dirty[0].c1 = c1;
+    }
+    g_disp_dirty = true;
+}
+
+/* Pixel-space marking for the graphics layer (called by frankos_gfx.c
+ * primitives with each op's bounding rect). */
+void basic_gfx_mark(int x1, int y1, int x2, int y2)
+{
+    mark_cells(y1 / BASIC_FH, x1 / BASIC_FW, y2 / BASIC_FH, x2 / BASIC_FW);
+}
+
 static void tbuf_clear(void)
 {
     for (int r = 0; r < BASIC_ROWS; r++)
@@ -144,7 +214,7 @@ static void tbuf_clear(void)
         }
     g_cur_col = 0;
     g_cur_row = 0;
-    g_disp_dirty = true;
+    mark_cells(0, 0, BASIC_ROWS - 1, BASIC_COLS - 1);
 }
 
 /* Non-static wrapper so frankos_platform.c's ClearScreen() can call it
@@ -160,6 +230,7 @@ static void tbuf_scroll_up(void)
         g_textbuf[BASIC_ROWS - 1][c].ch   = ' ';
         g_textbuf[BASIC_ROWS - 1][c].attr = DEFAULT_ATTR;
     }
+    mark_cells(0, 0, BASIC_ROWS - 1, BASIC_COLS - 1);
 }
 
 /*
@@ -186,7 +257,7 @@ void basic_tbuf_fill_cells(int r0, int c0, int r1, int c1, uint8_t attr)
             g_textbuf[r][c].ch   = ' ';
             g_textbuf[r][c].attr = attr;
         }
-    g_disp_dirty = true;
+    mark_cells(r0, c0, r1, c1);
 }
 
 /* PicoMite display-layer state: the editor (and any display-console
@@ -240,6 +311,7 @@ static uint8_t vt_cur_attr(void) {
 static void vt_put_cell(int r, int c, uint8_t ch, uint8_t attr) {
     g_textbuf[r][c].ch   = ch;
     g_textbuf[r][c].attr = attr;
+    mark_cells(r, c, r, c);
 }
 
 static void vt_clear_range(int r0, int c0, int r1, int c1) {
@@ -470,6 +542,36 @@ static void basic_paint(hwnd_t hwnd)
 {
     wd_begin(hwnd);
 
+    /* Query the WM's frame-dirty verdict FIRST: if this dispatch follows
+     * a frame fill (focus change, move, uncover) the client was just
+     * painted over with the theme background — losing that fact across
+     * a hold-skip left the window white with only sprite rects redrawn. */
+    bool frame_dirty;
+    {
+        typedef uint32_t (*fdq_t)(void);
+        fdq_t q = (fdq_t)_sys_table_ptrs[556];
+        frame_dirty = (!q || q());
+    }
+
+    /* Sprite compound (hide-restore + redraw) in flight: painting now
+     * would show the sprite half-erased.  Skip and retry on the next
+     * 25 ms flush tick — capped so a stuck hold degrades to flicker
+     * rather than a frozen display. */
+    {
+        extern volatile int basic_gfx_hold;
+        extern volatile bool g_gfx_paint_skipped;
+        static int held_paints;
+        if (basic_gfx_hold > 0 && !frame_dirty && held_paints < 8) {
+            held_paints++;
+            g_disp_dirty = true;
+            g_gfx_paint_skipped = true;   /* compound exit repays: sync */
+            wd_end();
+            return;
+        }
+        if (basic_gfx_hold <= 0)
+            held_paints = 0;
+    }
+
     bool fs = wm_is_fullscreen(hwnd);
 
     /* In fullscreen (640×480), the 79×24 text grid (632×384) doesn't
@@ -489,6 +591,8 @@ static void basic_paint(hwnd_t hwnd)
 
     /* Fill black margins in fullscreen on first paint / mode switch */
     static bool prev_fs = false;
+    if (fs != prev_fs)
+        g_force_full = true;
     if (fs && !prev_fs) {
         /* Top bar */
         wd_fill_rect(0, 0, DISPLAY_WIDTH, y_off, COLOR_BLACK);
@@ -552,8 +656,67 @@ static void basic_paint(hwnd_t hwnd)
     if (cur_col < 0) cur_col = 0;
     if (cur_col >= BASIC_COLS) cur_col = BASIC_COLS - 1;
 
-    for (int row = 0; row < vis_rows; row++) {
-        for (int col = 0; col < vis_cols; col++) {
+    /* ── Full vs partial repaint ────────────────────────────────────────
+     * Full when the WM reports the frame was dirty (moved/uncovered —
+     * framebuffer content unreliable; sys_table[556], absent on older
+     * OS builds), on fullscreen toggles, and on the first paint.
+     * Otherwise render only the accumulated dirty cell region (plus the
+     * cursor cell so typing echoes instantly). */
+    bool full = g_force_full || frame_dirty;
+    /* Snapshot the dirty rect list (plus the cursor cell as its own
+     * rect); full repaints use a single all-covering rect. */
+    dirty_rect_t rects[DIRTY_MAX + 1];
+    int nrect = 0;
+    if (full) {
+        rects[0].r0 = 0; rects[0].c0 = 0;
+        rects[0].r1 = vis_rows - 1; rects[0].c1 = vis_cols - 1;
+        nrect = 1;
+    } else {
+        int n = g_dirty_n;
+        if (n > DIRTY_MAX) n = DIRTY_MAX;
+        for (int i = 0; i < n; i++) {
+            rects[nrect].r0 = g_dirty[i].r0; rects[nrect].c0 = g_dirty[i].c0;
+            rects[nrect].r1 = g_dirty[i].r1; rects[nrect].c1 = g_dirty[i].c1;
+            nrect++;
+        }
+        rects[nrect].r0 = rects[nrect].r1 = cur_row;
+        rects[nrect].c0 = rects[nrect].c1 = cur_col;
+        nrect++;
+        for (int i = 0; i < nrect; i++) {
+            if (rects[i].r0 < 0) rects[i].r0 = 0;
+            if (rects[i].c0 < 0) rects[i].c0 = 0;
+            if (rects[i].r1 >= vis_rows) rects[i].r1 = vis_rows - 1;
+            if (rects[i].c1 >= vis_cols) rects[i].c1 = vis_cols - 1;
+        }
+    }
+    g_dirty_n    = 0;
+    g_force_full = false;
+
+    for (int ri = 0; ri < nrect; ri++) {
+    int pr0 = rects[ri].r0, pc0 = rects[ri].c0;
+    int pr1 = rects[ri].r1, pc1 = rects[ri].c1;
+    if (pr0 > pr1 || pc0 > pc1) continue;
+
+    /* Row staging: when a paint covers a wide span, bulk-copy the gfx
+     * layer's rows for this text row into SRAM once, instead of one tiny
+     * uncached-PSRAM memcpy per blank cell per glyph row (~30k for a
+     * full composite).  Roughly halves full-repaint cost. */
+    static uint8_t gfx_rowblk[BASIC_FH * (BASIC_CLIENT_W / 2)];
+
+    for (int row = pr0; row <= pr1; row++) {
+        bool staged = false;
+        int  spanb0 = pc0 * (BASIC_FW / 2);
+        int  spanbn = (pc1 - pc0 + 1) * (BASIC_FW / 2);
+        if (basic_gfx_buf && (pc1 - pc0) > 16) {
+            for (int gy = 0; gy < BASIC_FH; gy++)
+                memcpy(gfx_rowblk + gy * (BASIC_CLIENT_W / 2) + spanb0,
+                       basic_gfx_buf
+                           + (row * BASIC_FH + gy) * (BASIC_CLIENT_W / 2)
+                           + spanb0,
+                       (size_t)spanbn);
+            staged = true;
+        }
+        for (int col = pc0; col <= pc1; col++) {
             uint8_t ch   = g_textbuf[row][col].ch;
             uint8_t attr = g_textbuf[row][col].attr;
 
@@ -562,6 +725,30 @@ static void basic_paint(hwnd_t hwnd)
              * be invisible — fall back to a gray block. */
             bool cursor = (row == cur_row && col == cur_col &&
                            g_cur_vis && g_vt_cursor_on);
+
+            /* Graphics layer: blank default-attribute cells are
+             * transparent — their 8x16 block comes from the BASIC
+             * graphics buffer.  Both source (col*8/2) and destination
+             * are byte-aligned (x_off is 0 or 4), so each glyph row is
+             * a straight 4-byte copy. */
+            if (!cursor && ch == ' ' && attr == DEFAULT_ATTR &&
+                basic_gfx_buf) {
+                const uint8_t *src = staged
+                    ? gfx_rowblk + (col * BASIC_FW) / 2
+                    : basic_gfx_buf
+                                   + (row * BASIC_FH) * (BASIC_CLIENT_W / 2)
+                                   + (col * BASIC_FW) / 2;
+                uint8_t *drow = dst
+                              + (row * BASIC_FH) * stride
+                              + (col * BASIC_FW) / 2;
+                for (int gy = 0; gy < BASIC_FH; gy++) {
+                    memcpy(drow, src, BASIC_FW / 2);
+                    src  += BASIC_CLIENT_W / 2;
+                    drow += stride;
+                }
+                continue;
+            }
+
             uint8_t eff_attr = attr;
             if (cursor) {
                 eff_attr = (uint8_t)((attr >> 4) | (attr << 4));
@@ -589,12 +776,50 @@ static void basic_paint(hwnd_t hwnd)
         }
     }
 
+    }   /* rect loop */
+
+    {   /* completed paint — release any waiting basic_gfx_sync() */
+        extern volatile uint32_t g_paint_serial;
+        g_paint_serial++;
+    }
     wd_end();
 }
 
 /* ═════════════════════════════════════════════════════════════════════════
  * Window event callback
  * ═════════════════════════════════════════════════════════════════════════ */
+
+/* ── Sprite frame sync ──────────────────────────────────────────────────────
+ * When basic_paint() had to skip because a sprite compound was in flight,
+ * the compound's exit calls basic_gfx_sync(): paint the window NOW (in a
+ * guaranteed-complete state) before the interpreter starts the next
+ * compound.  Free-running sprite loops self-throttle to the paint rate
+ * instead of starving the compositor (which produced cap-forced paints
+ * mid-compound = flicker). */
+volatile bool g_gfx_paint_skipped = false;
+
+/* Bumped at the end of every completed (non-skipped) basic_paint.  The
+ * sync waits on it: a blind one-tick delay was not enough — the paint it
+ * requested often landed on the NEXT sprite compound, forcing the next
+ * sync too (every iteration paid the yield: "PAUSE 2 feels like 4"). */
+volatile uint32_t g_paint_serial;
+
+void basic_gfx_sync(void)
+{
+    extern volatile int basic_gfx_hold;
+    if (basic_gfx_hold)                 /* nested compound still open */
+        return;
+    if (g_gfx_paint_skipped && g_hwnd != HWND_NULL) {
+        uint32_t s0 = g_paint_serial;
+        g_gfx_paint_skipped = false;
+        g_disp_dirty = false;           /* invalidating directly */
+        wm_invalidate(g_hwnd);
+        /* Wait until the paint actually COMPLETES so it cannot collide
+         * with the caller's next compound.  Bounded: ~3 ticks max. */
+        for (int i = 0; i < 3 && g_paint_serial == s0; i++)
+            vTaskDelay(1);
+    }
+}
 
 /* Push a NUL-terminated string into the keyboard ring buffer. */
 static void push_vt(const char *s)
@@ -617,14 +842,31 @@ static bool basic_event(hwnd_t hwnd, const window_event_t *event)
         return true;
     }
 
+    if (event->type == WM_SETFOCUS)  { g_focused = true;  return true; }
+    if (event->type == WM_KILLFOCUS) { g_focused = false; return true; }
+
     /* WM_CHAR: printable characters and control chars (Enter, BS, Tab, Esc…) */
     if (event->type == WM_CHAR) {
-        char ch = event->charev.ch;
-        if (ch == '\x03') {   /* Ctrl+C */
+        unsigned char ch = (unsigned char)event->charev.ch;
+        if (ch == '\x03') {   /* Ctrl+C (translated) — break, don't buffer:
+                                 the WM_KEYDOWN path already pushed 0x03 */
             MMAbort = 1;
+            return true;
         }
-        if (ch != '\0')
-            basic_kbuf_push((unsigned char)ch);
+        /* Ctrl chords aren't text: the OS also delivers the bare letter
+         * of a Ctrl+letter chord through WM_CHAR (Ctrl+C left a stray
+         * 'c' at the prompt after a break).  The WM_KEYDOWN handler owns
+         * chord semantics. */
+        if ((event->charev.modifiers & KMOD_CTRL) && ch >= 0x20)
+            return true;
+        /* Non-ASCII only: the OS keyboard layer ALSO delivers special
+         * keys (arrows etc.) as UTF-8 extended chars (C2 8x) through
+         * WM_CHAR.  We already push those keys as VT escape sequences
+         * from WM_KEYDOWN, and the stray 0x8x continuation byte lands
+         * exactly in PicoMite's arrow-code range — every arrow press
+         * executed a second, WRONG arrow ("diagonal" cursor motion). */
+        if (ch != '\0' && ch < 0x80)
+            basic_kbuf_push(ch);
         return true;
     }
 
@@ -706,21 +948,38 @@ static void blink_cb(TimerHandle_t t)
     static short last_x = -1, last_y = -1;
     static bool  last_on = true;
 
-    if (++tick >= 20) {
-        tick = 0;
-        g_cur_vis = !g_cur_vis;
-        g_disp_dirty = true;
+    {
+        static int mark_r = -1, mark_c = -1;
+        bool cursor_evt = false;
+        if (++tick >= 20) {
+            tick = 0;
+            g_cur_vis = !g_cur_vis;
+            cursor_evt = true;
+        }
+        if (CurrentX != last_x || CurrentY != last_y ||
+            g_vt_cursor_on != last_on) {
+            last_x  = CurrentX;
+            last_y  = CurrentY;
+            last_on = g_vt_cursor_on;
+            cursor_evt = true;
+        }
+        if (cursor_evt) {
+            int cr = CurrentY / BASIC_FH, cc = CurrentX / BASIC_FW;
+            if (mark_r >= 0)
+                mark_cells(mark_r, mark_c, mark_r, mark_c);
+            mark_cells(cr, cc, cr, cc);
+            mark_r = cr; mark_c = cc;
+        }
     }
-    if (CurrentX != last_x || CurrentY != last_y ||
-        g_vt_cursor_on != last_on) {
-        last_x  = CurrentX;
-        last_y  = CurrentY;
-        last_on = g_vt_cursor_on;
-        g_disp_dirty = true;
-    }
-    if (g_disp_dirty && g_hwnd != HWND_NULL) {
-        g_disp_dirty = false;
-        wm_invalidate(g_hwnd);
+    {
+        static int unfocused_skip = 0;
+        if (g_disp_dirty && g_hwnd != HWND_NULL) {
+            if (g_focused || ++unfocused_skip >= 10) {
+                unfocused_skip = 0;
+                g_disp_dirty = false;
+                wm_invalidate(g_hwnd);
+            }
+        }
     }
 }
 
@@ -770,7 +1029,8 @@ int main(int argc, char **argv)
     printf("[basic] wm_create_window %dx%d at (%d,%d)\n", fw, fh, x, y);
 
     g_hwnd = wm_create_window(x, y, fw, fh, "MMBasic",
-                              WSTYLE_DIALOG | WF_FULLSCREENABLE | WF_HIDE_CURSOR,
+                              WSTYLE_DIALOG | WF_FULLSCREENABLE | WF_HIDE_CURSOR |
+                              WF_NOCLEAR,
                               basic_event, basic_paint);
     printf("[basic] g_hwnd: %p\n", (void*)(uintptr_t)g_hwnd);
     if (g_hwnd == HWND_NULL) {
@@ -810,4 +1070,7 @@ int main(int argc, char **argv)
     return 0;
 }
 
-uint32_t __app_flags(void) { return APPFLAG_SINGLETON; }
+/* BACKGROUND: keep executing when another app has focus — without it
+ * the OS swap layer suspends the interpreter task on focus loss (a
+ * running BASIC program froze whenever e.g. Calculator was focused). */
+uint32_t __app_flags(void) { return APPFLAG_SINGLETON | APPFLAG_BACKGROUND; }

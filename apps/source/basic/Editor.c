@@ -356,18 +356,44 @@ void MX470Display(int fn)
         gui_bcolour = t;
         break;
     case CLEAR_TO_EOL:
+#ifdef _FRANKOS
+        /* clears must hit the TEXT CELL grid, not the pixel layer */
+        { extern void basic_cellclear_px(int,int,int,int,int);
+          basic_cellclear_px(CurrentX, CurrentY, HRes - 1,
+                             CurrentY + gui_font_height - 1, gui_bcolour); }
+#else
         DrawBox(CurrentX, CurrentY, HRes - 1, CurrentY + gui_font_height - 1, 0, 0, gui_bcolour);
+#endif
         break;
     case CLEAR_TO_EOS:
+#ifdef _FRANKOS
+        { extern void basic_cellclear_px(int,int,int,int,int);
+          basic_cellclear_px(CurrentX, CurrentY, HRes - 1,
+                             CurrentY + gui_font_height - 1, gui_bcolour);
+          basic_cellclear_px(0, CurrentY + gui_font_height, HRes - 1,
+                             VRes - 1, gui_bcolour); }
+#else
         DrawBox(CurrentX, CurrentY, HRes - 1, CurrentY + gui_font_height - 1, 0, 0, gui_bcolour);
         DrawRectangle(0, CurrentY + gui_font_height, HRes - 1, VRes - 1, gui_bcolour);
+#endif
         break;
 #endif
     case SCROLL_DOWN:
         break;
     case DRAW_LINE:
+#ifdef _FRANKOS
+        { extern void basic_cellclear_px(int,int,int,int,int);
+          basic_cellclear_px(0, gui_font_height * (Option.Height - 2),
+                             HRes - 1, VRes - 1, gui_bcolour); }
+#else
         DrawBox(0, gui_font_height * (Option.Height - 2), HRes - 1, VRes - 1, 0, 0, (DISPLAY_TYPE == SCREENMODE1 ? 0 : gui_bcolour));
+#endif
+#ifndef _FRANKOS
+        /* Cosmetic separator above the status line — on Frank OS this
+         * lands in the pixel graphics layer and bleeds through the
+         * transparent console cells as a stray coloured line. */
         DrawLine(0, (VRes / gui_font_height) * gui_font_height - gui_font_height - 6, HRes - 1, (VRes / gui_font_height) * gui_font_height - gui_font_height - 6, 1, GUI_C_LINE);
+#endif
 #ifdef PICOMITEVGA
 #ifdef HDMI
         if (FullColour)
@@ -2527,6 +2553,30 @@ char *findLine(int ln, int *inmulti)
     return (char *)p;
 }
 
+/* First-letter prefilter for SetColour's keyword scans.  Comparing every
+ * command/token table entry with EditCompStr at each word start costs
+ * hundreds of string compares per keystroke (x2 render passes, x24 lines
+ * on a printScreen) - and on Frank OS the app's code AND tables execute
+ * from PSRAM, where that measured as several hundred ms per typed
+ * character in large programs.  One lazy pass caches each entry's first
+ * letter in a compact array; the scans skip non-matches on a byte
+ * compare.  '_'-prefixed commands match a '.' in source (see the alias
+ * handling in the scan), so '_' entries are stored as '.' too. */
+#define EDIT_KWIDX_MAX 1024
+static unsigned char cmd_initial[EDIT_KWIDX_MAX];
+static unsigned char tok_initial[EDIT_KWIDX_MAX];
+static int kwidx_ready = 0;
+
+static void kwidx_build(void)
+{
+    int i;
+    for (i = 0; i < CommandTableSize - 1 && i < EDIT_KWIDX_MAX; i++)
+        cmd_initial[i] = (unsigned char)mytoupper(commandtbl[i].name[0]);
+    for (i = 0; i < TokenTableSize - 1 && i < EDIT_KWIDX_MAX; i++)
+        tok_initial[i] = (unsigned char)mytoupper(tokentbl[i].name[0]);
+    kwidx_ready = 1;
+}
+
 int EditCompStr(char *p, char *tkn)
 {
     while (*tkn && (mytoupper(*tkn) == mytoupper(*p)))
@@ -2730,8 +2780,15 @@ void SetColour(unsigned char *p, int DoVT100)
     // check if this is the start of a keyword
     if (isnamechar(*p) && !intext)
     {
+        unsigned char up0;
+        if (!kwidx_ready)
+            kwidx_build();
+        up0 = (unsigned char)mytoupper(*p);
         for (i = 0; i < CommandTableSize - 1; i++)
         { // check the command table for a match
+            if (i < EDIT_KWIDX_MAX && cmd_initial[i] != up0 &&
+                !(*p == '.' && cmd_initial[i] == '_'))
+                continue;   /* first letter can't match - skip the compare */
             if (EditCompStr((char *)p, (char *)commandtbl[i].name) != 0 ||
                 ((EditCompStr((char *)&p[1], (char *)&commandtbl[i].name[1]) != 0) && *p == '.' && *commandtbl[i].name == '_'))
             {
@@ -2763,6 +2820,8 @@ void SetColour(unsigned char *p, int DoVT100)
         }
         for (i = 0; i < TokenTableSize - 1; i++)
         { // check the token table for a match
+            if (i < EDIT_KWIDX_MAX && tok_initial[i] != up0)
+                continue;   /* first letter can't match - skip the compare */
             if (EditCompStr((char *)p, (char *)tokentbl[i].name) != 0)
             {
                 gui_fcolour = GUI_C_KEYWORD;
@@ -2913,8 +2972,13 @@ void printScreen(void)
         curx = 0;
         cury = i + 1;
     }
+#ifndef _FRANKOS
+    /* Frank OS: do NOT drain the console here — with the wrapped
+     * keyboard buffer this throws away characters the user typed
+     * while the redraw ran (typed-text loss during any backlog). */
     while (getConsole() != -1)
         ; // consume any keystrokes accumulated while redrawing the screen
+#endif
 }
 
 // position the cursor on the screen
@@ -3138,8 +3202,13 @@ void Scroll(void)
     PrintFunctKeys(EDIT);
     printLine(VHeight - 1 + edy);
     PositionCursor(txtp);
+#ifndef _FRANKOS
+    /* Frank OS: do NOT drain the console here — with the wrapped
+     * keyboard buffer this throws away characters the user typed
+     * while the redraw ran (typed-text loss during any backlog). */
     while (getConsole() != -1)
         ; // consume any keystrokes accumulated while redrawing the screen
+#endif
 }
 
 // scroll down the video screen

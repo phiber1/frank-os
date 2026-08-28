@@ -259,6 +259,13 @@ void MIPS16 initFonts(void)
     FontTable[13] = NULL;
     FontTable[14] = NULL;
     FontTable[15] = NULL;
+#ifdef _FRANKOS
+    /* The console/editor geometry requires the converted 8x16 OS font in
+     * slot 1.  initFonts() is re-run by SaveProgramToFlash on every
+     * program save — without this re-pin each save reverted slot 1 to
+     * the 12x20 Misc font and broke the editor's row/column math. */
+    { extern unsigned char basic_pm_font8x16[]; FontTable[1] = basic_pm_font8x16; }
+#endif
 }
 #if PICOMITERP2350
 uint16_t __not_in_flash_func(RGB565)(uint32_t c)
@@ -687,6 +694,17 @@ void DrawPixelNormal(int x, int y, int c)
 #endif
 void ClearScreen(int c)
 {
+#ifdef _FRANKOS
+    /* CLS clears both layers: pixel graphics AND the text cell grid.
+     * Draw.c's own body below is gated on DISPLAY_TYPE (0 here), so the
+     * graphics buffer must be cleared explicitly. */
+    {
+        extern void basic_tbuf_clear(void);
+        extern void basic_gfx_clear(int colour);
+        basic_tbuf_clear();
+        basic_gfx_clear(c);
+    }
+#endif
     if (!Option.DISPLAY_TYPE)
         return;
 #if PICOMITERP2350
@@ -5638,6 +5656,9 @@ void contractpixel(volatile unsigned char *ii, volatile unsigned char *oo, int n
 
 void BlitShowBuffer(int bnbr, int x1, int y1, int mode)
 {
+#ifdef _FRANKOS
+    { extern volatile int basic_gfx_hold; basic_gfx_hold++; }
+#endif
     struct spritebuffer *sb = spritebuff[bnbr]; // Cache pointer for performance
     char *current;
     int x, xx, y, yy, rotation, fullmode = mode;
@@ -5693,6 +5714,10 @@ void BlitShowBuffer(int bnbr, int x1, int y1, int mode)
         if (!(mode & 4))
             sb->active = 1;
     }
+#ifdef _FRANKOS
+    { extern volatile int basic_gfx_hold; extern void basic_gfx_sync(void);
+      basic_gfx_hold--; basic_gfx_sync(); }
+#endif
 }
 int sumlayer(void)
 {
@@ -5703,6 +5728,9 @@ int sumlayer(void)
 }
 void hidesafe(int bnbr)
 {
+#ifdef _FRANKOS
+    { extern volatile int basic_gfx_hold; basic_gfx_hold++; }
+#endif
     struct spritebuffer *sb = spritebuff[bnbr]; // Cache pointer for performance
     int found = INT_MAX;
     int zerolifo = 0;
@@ -5769,10 +5797,17 @@ void hidesafe(int bnbr)
             }
         }
     }
+#ifdef _FRANKOS
+    { extern volatile int basic_gfx_hold; extern void basic_gfx_sync(void);
+      basic_gfx_hold--; basic_gfx_sync(); }
+#endif
 }
 
 void showsafe(int bnbr, int x, int y)
 {
+#ifdef _FRANKOS
+    { extern volatile int basic_gfx_hold; basic_gfx_hold++; }
+#endif
     int found = INT_MAX;
     int zerolifo = 0;
     int i;
@@ -5823,6 +5858,10 @@ void showsafe(int bnbr, int x, int y)
             BlitShowBuffer(idx, spritebuff[idx]->x, spritebuff[idx]->y, 0);
         }
     }
+#ifdef _FRANKOS
+    { extern volatile int basic_gfx_hold; extern void basic_gfx_sync(void);
+      basic_gfx_hold--; basic_gfx_sync(); }
+#endif
 }
 void MIPS16 loadsprite(unsigned char *p)
 {
@@ -7627,7 +7666,15 @@ void restorepanel(void)
         DrawPixel = DrawPixelMEM332;
 #endif
     }
+#ifdef _FRANKOS
+    /* restorepanel() runs on EVERY BASIC error (MMBasic.c error path).
+     * NULLing WriteBuf here made SPRITE report "Not available on
+     * physical display" after any error.  Our graphics layer is the
+     * permanent memory framebuffer — re-pin it. */
+    { extern unsigned char *basic_gfx_buf; WriteBuf = basic_gfx_buf; }
+#else
     WriteBuf = NULL;
+#endif
 }
 void setframebuffer(void)
 {
@@ -7669,7 +7716,11 @@ void closeframebuffer(char layer)
     if (FrameBuf || LayerBuf)
         restorepanel();
     FrameBuf = NULL;
+#ifdef _FRANKOS
+    { extern unsigned char *basic_gfx_buf; WriteBuf = basic_gfx_buf; }
+#else
     WriteBuf = NULL;
+#endif
 }
 #include <stdint.h>
 #include <string.h>
@@ -12102,6 +12153,7 @@ void DrawCircleRingLineByLine(int x, int y, int r1, int r2, int c, MMFLOAT aspec
 
  The char is printed at the current location defined by CurrentX and CurrentY
  *****************************************************************************************/
+#ifndef _FRANKOS  /* Frank OS console renders text cells, not pixels */
 void DisplayPutC(char c)
 {
 
@@ -12163,6 +12215,9 @@ void DisplayPutC(char c)
     GUIPrintChar(gui_font, gui_fcolour, gui_bcolour, c, ORIENT_NORMAL); // print it
     routinechecks();
 }
+#endif
+
+#ifndef _FRANKOS  /* Frank OS cursor lives in the cell console */
 void ShowCursor(int show)
 {
     static int visible = false;
@@ -12188,6 +12243,8 @@ void ShowCursor(int show)
         high_x = x2;
     routinechecks();
 }
+#endif
+
 #ifndef PICOMITEWEB
 
 void DrawPolygon(int n, short *xcoord, short *ycoord, int face)

@@ -41,6 +41,7 @@ set(MMBASIC_SOURCES
     Editor.c
     XModem.c
     MM_Misc.c
+    Draw.c
     Memory.c
     External.c
     MATHS.c
@@ -60,6 +61,7 @@ set(FRANKOS_SOURCES
     frankos_stubs.c
     frankos_audio.c
     frankos_ff.c
+    frankos_gfx.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../src/font8x16.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../api/m-os-api-sdtfn.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../api/m-os-api-math.c
@@ -121,6 +123,7 @@ target_compile_options(basic PRIVATE
 set_source_files_properties(MATHS.c      PROPERTIES COMPILE_FLAGS -Os)
 set_source_files_properties(frankos_audio.c PROPERTIES COMPILE_FLAGS -Os)
 set_source_files_properties(Editor.c     PROPERTIES COMPILE_FLAGS -Os)
+set_source_files_properties(Draw.c       PROPERTIES COMPILE_FLAGS -Os)
 set_source_files_properties(aes.c        PROPERTIES COMPILE_FLAGS -Os)
 set_source_files_properties(re.c         PROPERTIES COMPILE_FLAGS -Os)
 set_source_files_properties(GPS.c        PROPERTIES COMPILE_FLAGS -Os)
@@ -149,6 +152,7 @@ target_link_options(basic PRIVATE
     -Wl,--wrap,disable_interrupts_pico
     -Wl,--wrap,enable_interrupts_pico
     -Wl,--wrap,flash_do_cmd
+    -Wl,--wrap,get_rand_32
     -Wl,--no-gc-sections                          # -r + gc-sections is invalid
 )
 

@@ -1205,7 +1205,15 @@ void InitHeap(bool all)
     FrameBuf = (unsigned char *)FRAMEBUFFER;
 #else
     FrameBuf = NULL;
+#ifdef _FRANKOS
+    /* ClearRuntime calls InitHeap(true) on EVERY RUN — NULLing WriteBuf
+     * here made SPRITE work at the prompt but fail inside programs
+     * ("Not available on physical display").  Our graphics layer is the
+     * permanent memory framebuffer — re-pin it. */
+    { extern unsigned char *basic_gfx_buf; WriteBuf = basic_gfx_buf; }
+#else
     WriteBuf = NULL;
+#endif
     LayerBuf = NULL;
 #endif
 }

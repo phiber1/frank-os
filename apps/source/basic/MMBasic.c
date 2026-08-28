@@ -397,9 +397,6 @@ static int GetStructAlignment(struct s_structdef *sd)
 // Initialise MMBasic
 void MIPS16 InitBasic(void)
 {
-#ifdef _FRANKOS
-    serial_dbg("[InitBasic] enter\n");
-#endif
     DefaultType = T_NBR;
     CommandTableSize = (sizeof(commandtbl) / sizeof(struct s_tokentbl));
     TokenTableSize = (sizeof(tokentbl) / sizeof(struct s_tokentbl));
@@ -413,13 +410,7 @@ void MIPS16 InitBasic(void)
     g_structcnt = 0;
 #endif
 
-#ifdef _FRANKOS
-    serial_dbg("[InitBasic] ClearProgram...\n");
-#endif
     ClearProgram(true);
-#ifdef _FRANKOS
-    serial_dbg("[InitBasic] ClearProgram done\n");
-#endif
 
     // load the commonly used tokens
     // by looking them up once here performance is improved considerably
@@ -5493,17 +5484,8 @@ void MIPS16 ClearRuntime(bool all)
     }
     optionsuppressstatus = 0;
 #endif
-#ifdef _FRANKOS
-    serial_dbg("[ClearRuntime] CloseAllFiles...\n");
-#endif
     CloseAllFiles();
-#ifdef _FRANKOS
-    serial_dbg("[ClearRuntime] ClearExternalIO...\n");
-#endif
     ClearExternalIO(); // this MUST come before InitHeap(true)
-#ifdef _FRANKOS
-    serial_dbg("[ClearRuntime] ClearStack...\n");
-#endif
     ClearStack();
 #ifdef USBKEYBOARD
     clearrepeat();
@@ -5570,20 +5552,11 @@ void MIPS16 ClearRuntime(bool all)
 #endif
     MMerrno = 0; // clear the error flags
     *MMErrMsg = 0;
-#ifdef _FRANKOS
-    serial_dbg("[ClearRuntime] ClearVars...\n");
-#endif
     ClearVars(0, true);
 #ifndef PICOMITEWEB
     turtle_free(); // Free turtle state before heap is wiped
 #endif
-#ifdef _FRANKOS
-    serial_dbg("[ClearRuntime] InitHeap...\n");
-#endif
     InitHeap(true);
-#ifdef _FRANKOS
-    serial_dbg("[ClearRuntime] InitHeap done\n");
-#endif
 #ifdef STRUCTENABLED
     // After InitHeap, all heap memory tracking is reset. The g_structtbl pointers
     // now point to memory without valid allocation tracking. We must NULL them
