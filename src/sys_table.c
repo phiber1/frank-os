@@ -746,5 +746,7 @@ unsigned long __in_systable() __aligned(4096) sys_table_ptrs[] = {
     L,                            // 552
     lang_set,                     // 553
     wd_radio,                     // 554
+    netcard_abort,                // 555
+    wm_paint_was_frame_dirty,     // 556
     0
 };

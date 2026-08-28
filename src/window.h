@@ -72,6 +72,8 @@ typedef uint8_t hwnd_t;
 #define WF_SUSPENDED   (1u << 10) /* app task is suspended (swap) */
 #define WF_FULLSCREENABLE (1u << 11) /* window supports fullscreen toggle */
 #define WF_HIDE_CURSOR    (1u << 12) /* hide mouse cursor over client area */
+#define WF_NOCLEAR        (1u << 13) /* skip client fill in decorations —
+                                        app repaints its full client */
 
 /*==========================================================================
  * Window state
@@ -173,6 +175,11 @@ window_t *wm_get_window(hwnd_t hwnd); /* NULL if invalid */
 
 /* Invalidation — marks window for repaint */
 void wm_invalidate(hwnd_t hwnd);
+
+/* Non-zero when the current paint dispatch followed a FRAME-dirty state
+ * (window moved/uncovered): prior client pixels are unreliable, apps
+ * must repaint fully.  Zero for content-only invalidates. */
+uint32_t wm_paint_was_frame_dirty(void);
 
 /* Set title string */
 void wm_set_title(hwnd_t hwnd, const char *title);

@@ -159,9 +159,19 @@ bool taskbar_needs_redraw(void) {
 
 void taskbar_tick(void) {
     if (!taskbar_ready) return;
+    /* Compare tick-minutes against a tick-minute baseline OWNED BY THIS
+     * FUNCTION.  It previously compared against last_clock_minute, which
+     * the clock renderer sets from the RTC epoch when an RTC is present —
+     * a different epoch, never equal — so this fired taskbar_invalidate()
+     * on EVERY call, forever: a permanent invalidate storm that kept the
+     * WM loop's quiet path from ever engaging (and, with the taskbar
+     * suppressed under a fullscreen window, ground apps to a crawl). */
+    static uint32_t last_tick_minute = 0xFFFFFFFF;
     uint32_t now_min = (xTaskGetTickCount() / configTICK_RATE_HZ) / 60;
-    if (now_min != last_clock_minute)
+    if (now_min != last_tick_minute) {
+        last_tick_minute = now_min;
         taskbar_invalidate();
+    }
 
     /* Force one more repaint after network activity expires so the
      * tray icon transitions from active back to idle. */
@@ -176,14 +186,20 @@ void taskbar_tick(void) {
 void taskbar_draw(void) {
     if (!taskbar_ready || !taskbar_dirty) return;
 
-    /* Suppress taskbar when focused window covers entire screen (fullscreen) */
+    /* Suppress taskbar when focused window covers entire screen (fullscreen).
+     * MUST still clear the dirty flag: returning with it set left the WM
+     * loop grinding on a forever-dirty taskbar from the first clock
+     * minute-change onward — fullscreen apps slowed to a crawl until the
+     * window left fullscreen and the flag could finally clear. */
     hwnd_t fs_focus = wm_get_focus();
     if (fs_focus != HWND_NULL) {
         window_t *fw = wm_get_window(fs_focus);
         if (fw && fw->frame.x == 0 && fw->frame.y == 0 &&
             fw->frame.w == display_width && fw->frame.h == display_height &&
-            !(fw->flags & WF_BORDER))
+            !(fw->flags & WF_BORDER)) {
+            taskbar_dirty = false;
             return;
+        }
     }
 
     taskbar_dirty = false;

@@ -19,6 +19,7 @@
 #include "startmenu.h"
 #include "sysmenu.h"
 #include "swap.h"
+#include "cmd.h"
 #include "alttab.h"
 #include "desktop.h"
 #include "FreeRTOS.h"
@@ -229,6 +230,17 @@ hwnd_t wm_create_window(int16_t x, int16_t y, int16_t w, int16_t h,
                 if ((style & WF_BORDER) &&
                     uxTaskPriorityGet(caller) == 1 &&
                     !swap_find_by_task(caller)) {
+                    /* Honor APPFLAG_BACKGROUND on EVERY launch path.
+                     * Only the detached launcher pre-flagged the task;
+                     * apps launched in the foreground (menu, console)
+                     * lost the flag and got swap-suspended on focus
+                     * loss despite declaring background. */
+                    {
+                        cmd_ctx_t *c = get_cmd_ctx();
+                        if (c && c->pboot_ctx &&
+                            (c->pboot_ctx->app_flags & 1))
+                            swap_set_pending_background(caller);
+                    }
                     swap_register(hwnd, caller);
                     /* This new app becomes the foreground */
                     swap_switch_to(hwnd);
@@ -603,6 +615,17 @@ window_t *wm_get_window(hwnd_t hwnd) {
     return &windows[hwnd - 1];
 }
 
+/* Set before each paint_handler dispatch: non-zero when the window's
+ * FRAME was dirty (moved/uncovered/decorations refilled), meaning prior
+ * client pixels in the framebuffer are unreliable and the app must do a
+ * FULL repaint.  Zero for content-only invalidates, where an app may
+ * paint just its own dirty region.  Exposed to apps via sys_table. */
+uint8_t wm_paint_frame_dirty_flag = 1;
+
+uint32_t wm_paint_was_frame_dirty(void) {
+    return wm_paint_frame_dirty_flag;
+}
+
 void wm_invalidate(hwnd_t hwnd) {
     if (!valid_hwnd(hwnd)) return;
 
@@ -887,16 +910,38 @@ static void draw_window_decorations(hwnd_t hwnd, window_t *win) {
     uint16_t style = current_theme->style;
 
     if (!(win->flags & WF_BORDER)) {
-        /* No border — just fill with bg color */
-        gfx_fill_rect(f.x, f.y, f.w, f.h, win->bg_color);
+        /* No border — just fill with bg color (unless the app paints
+         * its full client itself and opted out of the clear). */
+        if (!(win->flags & WF_NOCLEAR))
+            gfx_fill_rect(f.x, f.y, f.w, f.h, win->bg_color);
         return;
     }
 
     uint8_t title_bg = focused ? THEME_ACTIVE_TITLE_BG : THEME_INACTIVE_TITLE_BG;
     uint8_t title_fg = focused ? THEME_ACTIVE_TITLE_FG : THEME_INACTIVE_TITLE_FG;
 
-    /* Fill entire frame with button face first */
-    gfx_fill_rect(f.x, f.y, f.w, f.h, THEME_BUTTON_FACE);
+    /* Fill entire frame with button face first.  WF_NOCLEAR windows
+     * paint every client pixel themselves on frame-dirty repaints — fill
+     * only the decoration strips so the client never flashes the theme
+     * background (very visible on large, dark app windows). */
+    if (win->flags & WF_NOCLEAR) {
+        int cx = f.x + THEME_BORDER_WIDTH;
+        int cy = f.y + THEME_BORDER_WIDTH + THEME_TITLE_HEIGHT;
+        if (win->flags & WF_MENUBAR)
+            cy += THEME_MENU_HEIGHT;
+        int cw = f.w - 2 * THEME_BORDER_WIDTH;
+        int cb = f.y + f.h - THEME_BORDER_WIDTH;   /* client bottom */
+        int ch = cb - cy;
+        if (cw < 0) cw = 0;
+        if (ch < 0) ch = 0;
+        gfx_fill_rect(f.x, f.y, f.w, cy - f.y, THEME_BUTTON_FACE);
+        gfx_fill_rect(f.x, cb, f.w, (f.y + f.h) - cb, THEME_BUTTON_FACE);
+        gfx_fill_rect(f.x, cy, cx - f.x, ch, THEME_BUTTON_FACE);
+        gfx_fill_rect(cx + cw, cy, (f.x + f.w) - (cx + cw), ch,
+                      THEME_BUTTON_FACE);
+    } else {
+        gfx_fill_rect(f.x, f.y, f.w, f.h, THEME_BUTTON_FACE);
+    }
 
     if (style & TSTYLE_BEVEL_3D) {
         /* Win95 outer frame: raised bevel (2px total) */
@@ -1265,6 +1310,8 @@ void wm_composite(void) {
                  * portion of the framebuffer and sets active=false
                  * when the client is fully off-screen.  No guard
                  * needed — partial off-screen windows paint fine. */
+                wm_paint_frame_dirty_flag =
+                    (win->flags & WF_FRAME_DIRTY) ? 1 : 0;
                 wd_begin(hwnd);
                 win->paint_handler(hwnd);
                 wd_end();
@@ -1295,6 +1342,7 @@ void wm_composite(void) {
         if (mwin && (mwin->flags & WF_VISIBLE)) {
             draw_window_decorations(mhwnd, mwin);
             if (mwin->paint_handler) {
+                wm_paint_frame_dirty_flag = 1;   /* content was overdrawn */
                 wd_begin(mhwnd);
                 mwin->paint_handler(mhwnd);
                 wd_end();

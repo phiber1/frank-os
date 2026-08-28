@@ -89,6 +89,8 @@ typedef uint8_t hwnd_t;
 #define WF_FRAME_DIRTY (1u << 9)  /* decorations need repaint */
 #define WF_FULLSCREENABLE (1u << 11) /* window supports fullscreen toggle */
 #define WF_HIDE_CURSOR    (1u << 12) /* hide mouse cursor over client area */
+#define WF_NOCLEAR        (1u << 13) /* skip client fill in decorations —
+                                        app repaints its full client */
 
 /* ========================================================================
  * Window style presets
