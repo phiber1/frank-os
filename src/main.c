@@ -235,6 +235,7 @@ typedef struct {
     uint32_t hfsr;
     uint32_t bfar;      /* Bus Fault Address Register */
     uint32_t r0, r1, r2, r3, r12;  /* stacked regs */
+    char     task[12];             /* current task name at fault time */
 } crash_dump_t;
 
 static crash_dump_t __attribute__((section(".uninitialized_data")))
@@ -242,6 +243,22 @@ static crash_dump_t __attribute__((section(".uninitialized_data")))
 
 // Forward declaration — used by the vector table fixup in main().
 void isr_hardfault(void);
+
+/* Called from vApplicationStackOverflowHook (hooks.c): record which task
+ * blew its stack, then reboot.  Overflows were previously SILENT — the
+ * canary check detected them and did nothing, leaving a trampled heap
+ * (adjacent TCBs/stacks) to fell the scheduler minutes later with an
+ * unexplainable corrupt-TCB hardfault. */
+void crash_report_stack_overflow(const char *name) {
+    g_crash_dump.magic = 0xDEAD0002;
+    int i = 0;
+    if (name)
+        for (; i < 11 && name[i]; i++)
+            g_crash_dump.task[i] = name[i];
+    g_crash_dump.task[i] = 0;
+    watchdog_reboot(0, 0, 10);
+    while (1) { __asm volatile("nop"); }
+}
 
 // Hard fault handler — saves crash info to SRAM, reboots via watchdog.
 // Named isr_hardfault to override the weak symbol in Pico SDK's vector table.
@@ -277,6 +294,14 @@ static void hex32(char *buf, uint32_t v) {
     buf[8] = '\0';
 }
 
+static bool ptr_looks_valid(const void *p) {
+    uintptr_t a = (uintptr_t)p;
+    return (a >= 0x20000000u && a < 0x20082000u) ||   /* SRAM  */
+           (a >= 0x11000000u && a < 0x11800000u) ||   /* PSRAM cached   */
+           (a >= 0x15000000u && a < 0x15800000u) ||   /* PSRAM uncached */
+           (a >= 0x10000000u && a < 0x11000000u);     /* flash (rodata) */
+}
+
 void __attribute__((used)) hardfault_c_handler(uint32_t *stack, uint32_t lr_val) {
     g_crash_dump.magic  = 0xDEAD0001;
     g_crash_dump.pc     = stack[6];
@@ -286,6 +311,19 @@ void __attribute__((used)) hardfault_c_handler(uint32_t *stack, uint32_t lr_val)
     g_crash_dump.cfsr   = *(volatile uint32_t *)0xE000ED28;
     g_crash_dump.hfsr   = *(volatile uint32_t *)0xE000ED2C;
     g_crash_dump.bfar   = *(volatile uint32_t *)0xE000ED38;
+    /* Record the current task's name — defensively, so a corrupted TCB
+     * cannot double-fault us out of the reboot path. */
+    {
+        int i = 0;
+        TaskHandle_t h = xTaskGetCurrentTaskHandle();
+        if (h && ptr_looks_valid(h)) {
+            const char *n = pcTaskGetName(h);
+            if (n && ptr_looks_valid(n))
+                for (; i < 11 && n[i]; i++)
+                    g_crash_dump.task[i] = n[i];
+        }
+        g_crash_dump.task[i] = 0;
+    }
     g_crash_dump.r0     = stack[0];
     g_crash_dump.r1     = stack[1];
     g_crash_dump.r2     = stack[2];
@@ -1090,6 +1128,13 @@ int main(void) {
     }
 #endif
 
+    if (g_crash_dump.magic == 0xDEAD0002) {
+        g_crash_dump.task[11] = 0;
+        printf("\n!!! PREVIOUS STACK OVERFLOW !!!\nTASK = %s\n",
+               g_crash_dump.task);
+        stdio_flush();
+        g_crash_dump.magic = 0;
+    }
     // Check for saved HardFault info from previous crash
     if (g_crash_dump.magic == 0xDEAD0001) {
         printf("\n!!! PREVIOUS HARDFAULT !!!\n");
@@ -1101,6 +1146,8 @@ int main(void) {
         printf("R0=%08lX R1=%08lX R2=%08lX R3=%08lX R12=%08lX\n",
                g_crash_dump.r0, g_crash_dump.r1, g_crash_dump.r2,
                g_crash_dump.r3, g_crash_dump.r12);
+        g_crash_dump.task[11] = 0;
+        printf("TASK = %s\n", g_crash_dump.task);
         stdio_flush();
         g_crash_dump.magic = 0;
     }
@@ -1222,7 +1269,11 @@ int main(void) {
 #else
     xTaskCreate(usb_service_task, "usb", 256, NULL, configMAX_PRIORITIES - 1, NULL);
 #endif
-    xTaskCreate(input_task, "input", 1024, NULL, 3, NULL);
+    /* 2048 words: start-menu / desktop click handlers run on this task,
+     * including Navigator's directory scan and dialogs — 1024 words
+     * overflowed once the scanned directory grew (silently corrupting
+     * neighbouring TCBs; the original "sporadic Navigator panic"). */
+    xTaskCreate(input_task, "input", 2048, NULL, 3, NULL);
     xTaskCreate(compositor_task, "compositor", 4096, NULL, 2, NULL);
 
     // xTaskCreate leaves BASEPRI raised (ulCriticalNesting = 0xaaaaaaaa by design).

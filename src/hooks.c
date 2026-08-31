@@ -108,7 +108,11 @@ void vApplicationStackOverflowHook( TaskHandle_t pxTask, char *pcTaskName )
 {
     if (_vApplicationStackOverflowHookPtr) _vApplicationStackOverflowHookPtr(pxTask, pcTaskName);
     else {
-        // TODO: draw_window
+        /* Never continue past a detected overflow: the trampled heap
+         * (adjacent task stacks/TCBs) fells the scheduler later with an
+         * undiagnosable hardfault.  Record the culprit and reboot. */
+        extern void crash_report_stack_overflow(const char *name);
+        crash_report_stack_overflow(pcTaskName);
     }
     /* Run time stack overflow checking is performed if
     configCHECK_FOR_STACK_OVERFLOW is defined to 1 or 2.  This hook

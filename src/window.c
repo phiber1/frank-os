@@ -19,7 +19,6 @@
 #include "startmenu.h"
 #include "sysmenu.h"
 #include "swap.h"
-#include "cmd.h"
 #include "alttab.h"
 #include "desktop.h"
 #include "FreeRTOS.h"
@@ -230,17 +229,6 @@ hwnd_t wm_create_window(int16_t x, int16_t y, int16_t w, int16_t h,
                 if ((style & WF_BORDER) &&
                     uxTaskPriorityGet(caller) == 1 &&
                     !swap_find_by_task(caller)) {
-                    /* Honor APPFLAG_BACKGROUND on EVERY launch path.
-                     * Only the detached launcher pre-flagged the task;
-                     * apps launched in the foreground (menu, console)
-                     * lost the flag and got swap-suspended on focus
-                     * loss despite declaring background. */
-                    {
-                        cmd_ctx_t *c = get_cmd_ctx();
-                        if (c && c->pboot_ctx &&
-                            (c->pboot_ctx->app_flags & 1))
-                            swap_set_pending_background(caller);
-                    }
                     swap_register(hwnd, caller);
                     /* This new app becomes the foreground */
                     swap_switch_to(hwnd);
