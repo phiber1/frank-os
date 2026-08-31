@@ -789,6 +789,68 @@ static void basic_paint(hwnd_t hwnd)
  * Window event callback
  * ═════════════════════════════════════════════════════════════════════════ */
 
+/* ── KEYDOWN() held-key tracking ────────────────────────────────────────────
+ * PicoMite's KEYDOWN() polls which keys are currently held — essential
+ * for games (move + fire simultaneously).  The USB keyboard driver that
+ * normally fills the array is excluded on this port; maintain it from
+ * WM_KEYDOWN / WM_KEYUP window events instead.  Codes match MMInkey's:
+ * arrows 0x80-0x83, F1-F12 0x91+, plain ASCII otherwise. */
+volatile int frankos_keydown[6];
+static uint8_t kd_scan[6];        /* HID scancode per slot, for release */
+
+static int kd_translate(uint8_t sc, uint8_t mod)
+{
+    bool shift = (mod & KMOD_SHIFT) != 0;
+    if (sc >= 0x04 && sc <= 0x1D)               /* a-z */
+        return (shift ? 'A' : 'a') + (sc - 0x04);
+    if (sc >= 0x1E && sc <= 0x26)               /* 1-9 */
+        return '1' + (sc - 0x1E);
+    switch (sc) {
+    case 0x27: return '0';
+    case 0x2C: return ' ';
+    case 0x28: case 0x58: return '\r';
+    case 0x29: return 27;
+    case 0x2A: return 8;
+    case 0x2B: return 9;
+    case 0x4C: return 127;
+    case 0x52: return 0x80;                     /* up    */
+    case 0x51: return 0x81;                     /* down  */
+    case 0x50: return 0x82;                     /* left  */
+    case 0x4F: return 0x83;                     /* right */
+    case 0x36: return ',';
+    case 0x37: return '.';
+    case 0x38: return '/';
+    case 0x2D: return '-';
+    case 0x2E: return '=';
+    }
+    if (sc >= 0x3A && sc <= 0x45)               /* F1-F12 */
+        return 0x91 + (sc - 0x3A);
+    return 0;
+}
+
+static void kd_press(uint8_t sc, uint8_t mod)
+{
+    int code = kd_translate(sc, mod);
+    if (!code) return;
+    for (int i = 0; i < 6; i++)
+        if (kd_scan[i] == sc) { frankos_keydown[i] = code; return; }
+    for (int i = 0; i < 6; i++)
+        if (!kd_scan[i]) {
+            kd_scan[i] = sc;
+            frankos_keydown[i] = code;
+            return;
+        }
+}
+
+static void kd_release(uint8_t sc)
+{
+    for (int i = 0; i < 6; i++)
+        if (kd_scan[i] == sc) {
+            kd_scan[i] = 0;
+            frankos_keydown[i] = 0;
+        }
+}
+
 /* ── Sprite frame sync ──────────────────────────────────────────────────────
  * When basic_paint() had to skip because a sprite compound was in flight,
  * the compound's exit calls basic_gfx_sync(): paint the window NOW (in a
@@ -843,7 +905,13 @@ static bool basic_event(hwnd_t hwnd, const window_event_t *event)
     }
 
     if (event->type == WM_SETFOCUS)  { g_focused = true;  return true; }
-    if (event->type == WM_KILLFOCUS) { g_focused = false; return true; }
+    if (event->type == WM_KILLFOCUS) {
+        g_focused = false;
+        /* KEYUPs for held keys go to the newly focused window — release
+         * everything so KEYDOWN() can't report stuck keys. */
+        for (int i = 0; i < 6; i++) { kd_scan[i] = 0; frankos_keydown[i] = 0; }
+        return true;
+    }
 
     /* WM_CHAR: printable characters and control chars (Enter, BS, Tab, Esc…) */
     if (event->type == WM_CHAR) {
@@ -870,10 +938,16 @@ static bool basic_event(hwnd_t hwnd, const window_event_t *event)
         return true;
     }
 
+    if (event->type == WM_KEYUP) {
+        kd_release(event->key.scancode);
+        return true;
+    }
+
     /* WM_KEYDOWN: navigation and function keys only (they have no WM_CHAR). */
     if (event->type == WM_KEYDOWN) {
         uint8_t sc  = event->key.scancode;
         uint8_t mod = event->key.modifiers;
+        kd_press(sc, mod);
 
         /* Ctrl+C via raw scan: HID 'c' = 0x06 */
         if ((mod & KMOD_CTRL) && sc == 0x06) {

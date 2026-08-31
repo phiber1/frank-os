@@ -3202,6 +3202,30 @@ void MIPS16 cmd_update(void)
     uint gpio_mask = 0u;
     reset_usb_boot(gpio_mask, PICO_STDIO_USB_RESET_BOOTSEL_INTERFACE_DISABLE_MASK);
 }
+#ifdef _FRANKOS
+/* KEYDOWN() for the Frank OS port: frankos_main.c maintains the
+ * held-key array from WM_KEYDOWN/WM_KEYUP window events.
+ * KEYDOWN(0) = number of keys held, KEYDOWN(1..6) = their codes
+ * (PicoMite codes: arrows 0x80-0x83, F-keys 0x91+, ASCII otherwise),
+ * KEYDOWN(8) = lock states (not tracked here, returns 0). */
+void fun_keydown(void)
+{
+    extern volatile int frankos_keydown[6];
+    int i, n = getint(ep, 0, 8);
+    iret = 0;
+    while (getConsole() != -1)
+        ; // clear anything in the input buffer (PicoMite behaviour)
+    if (n == 8)
+        iret = 0;
+    else if (n)
+        iret = frankos_keydown[n - 1];
+    else
+        for (i = 0; i < 6; i++)
+            if (frankos_keydown[i])
+                iret++;
+    targ = T_INT;
+}
+#endif
 #endif
 void MIPS16 disable_systemspi(void)
 {
