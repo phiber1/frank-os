@@ -1079,6 +1079,9 @@ static bool point_in_dirty_window(int16_t px, int16_t py) {
     return false;
 }
 
+/* PSRAM shadow buffer for flicker-free full repaints */
+static uint8_t *wm_shadow = NULL;
+
 void wm_composite(void) {
     cursor_overlay_lock();
 
@@ -1094,9 +1097,22 @@ void wm_composite(void) {
                      net_popup_is_open();
     {
         static bool prev_had_popup = false;
-        if (prev_had_popup && !has_popup)
-            needs_full_repaint = true;
+        static bool prev_only_startmenu = false;
+        if (prev_had_popup && !has_popup) {
+            /* The start menu restores its own pixels via save-under
+             * (startmenu_draw handles the pending restore later this
+             * cycle) — a forced full repaint here would bulldoze that
+             * with a visible whole-screen flash.  Other popups still
+             * need the full-clear fallback. */
+            if (!(prev_only_startmenu && startmenu_restore_pending()))
+                needs_full_repaint = true;
+        }
         prev_had_popup = has_popup;
+        if (has_popup)
+            prev_only_startmenu = startmenu_is_open() &&
+                !(sysmenu_is_open() || menu_is_open() ||
+                  menu_popup_is_open() || taskbar_popup_is_open() ||
+                  vol_popup_is_open() || net_popup_is_open());
     }
 
     /* Wait for vblank — cursor stays visible during this wait,
@@ -1106,6 +1122,41 @@ void wm_composite(void) {
     enum { CUR_ERASE_STAMP, CUR_RESET_STAMP, CUR_SKIP } cursor_mode;
 
     bool did_full_repaint = false;
+    bool shadow_active = false;
+
+    /* ── Flicker-free repaints via PSRAM shadow ──────────────────────
+     * Any cycle that repaints structure live on the single buffer is a
+     * visible white flash: full repaints, expose fills, and windows
+     * with FRAME_DIRTY decorations.  For those cycles, PRE-COPY the
+     * front buffer into a shadow, redirect ALL drawing there, and blit
+     * the finished frame back at the end.  The pre-copy preserves the
+     * compositor invariant that skipped/partial paints keep their old
+     * pixels (violating that left holes showing underlying windows). */
+    {
+        bool flashy = needs_full_repaint || expose_count > 0;
+        if (!flashy) {
+            for (uint8_t i = 0; i < z_count && !flashy; i++) {
+                window_t *w = &windows[z_stack[i] - 1];
+                if ((w->flags & WF_VISIBLE) && (w->flags & WF_FRAME_DIRTY))
+                    flashy = true;
+            }
+        }
+        if (flashy && display_bpp == 4) {
+            if (!wm_shadow && psram_is_available())
+                wm_shadow = (uint8_t *)psram_alloc(FB_STRIDE * FB_HEIGHT);
+            if (wm_shadow) {
+                /* Un-stamp the pointer FIRST: the cursor overlay works
+                 * on the show buffer, and pre-copying with the pointer
+                 * still stamped bakes a pointer image into the shadow
+                 * (the "box around the hourglass" / ghost squares). */
+                cursor_overlay_erase();
+                memcpy(wm_shadow, display_draw_buffer_ptr,
+                       FB_STRIDE * FB_HEIGHT);
+                display_redirect_draw(wm_shadow);
+                shadow_active = true;
+            }
+        }
+    }
 
     if (needs_full_repaint) {
         /*--- Fallback path: full repaint ---*/
@@ -1185,19 +1236,18 @@ void wm_composite(void) {
             cursor_overlay_erase();
             cursor_mode = CUR_ERASE_STAMP;
         } else {
-            /* Content-only path — test cursor against dirty windows */
+            /* Content-only path — painter's algorithm, no cleverness:
+             * if ANYTHING repaints this cycle (or the cursor moved or
+             * changed shape), erase the stamp first and re-stamp after
+             * painting.  The previous partial-overlap analysis had
+             * corner cases that left the cursor erased ("disappearing
+             * pointer") or left ghost pixels.  Cost is one 16x16
+             * save-under erase+stamp per dirty cycle — negligible. */
             int16_t sx, sy;
             bool stamped = cursor_overlay_get_stamp(&sx, &sy);
             int16_t mx, my;
             wm_get_cursor_pos(&mx, &my);
             bool cursor_moved = !stamped || mx != sx || my != sy;
-
-            /* Treat a cursor-type change the same as a move: the old
-             * stamp must be erased and re-drawn with the new shape.
-             * Without this, cursor_get_bounds returns bounds for the
-             * current type, not the stamped type, which can cause the
-             * overlap check to skip the erase — leaving stale
-             * save-under pixels that cut into a newly painted window. */
             if (cursor_overlay_type_changed())
                 cursor_moved = true;
 
@@ -1208,40 +1258,11 @@ void wm_composite(void) {
                     any_dirty = true;
             }
 
-            if (!any_dirty && !taskbar_needs_redraw()) {
-                if (!cursor_moved) {
-                    cursor_mode = CUR_SKIP;
-                } else {
-                    cursor_overlay_erase();
-                    cursor_mode = CUR_ERASE_STAMP;
-                }
+            if (any_dirty || taskbar_needs_redraw() || cursor_moved) {
+                cursor_overlay_erase();
+                cursor_mode = CUR_ERASE_STAMP;
             } else {
-                int16_t cx = stamped ? sx : mx;
-                int16_t cy = stamped ? sy : my;
-                int16_t bx0, by0, bx1, by1;
-                cursor_get_bounds(cx, cy, &bx0, &by0, &bx1, &by1);
-
-                bool tl = point_in_dirty_window(bx0, by0);
-                bool tr = point_in_dirty_window(bx1, by0);
-                bool bl = point_in_dirty_window(bx0, by1);
-                bool br = point_in_dirty_window(bx1, by1);
-
-                if (tl && tr && bl && br) {
-                    /* Cursor fully inside dirty area — erase it so the
-                     * window paint can write clean pixels underneath. */
-                    cursor_overlay_erase();
-                    cursor_mode = CUR_ERASE_STAMP;
-                } else if (!tl && !tr && !bl && !br && !cursor_moved) {
-                    cursor_mode = CUR_SKIP;
-                } else if (!cursor_moved) {
-                    /* Cursor partially overlaps dirty area — erase to
-                     * prevent ghost pixels from the old stamp. */
-                    cursor_overlay_erase();
-                    cursor_mode = CUR_ERASE_STAMP;
-                } else {
-                    cursor_overlay_erase();
-                    cursor_mode = CUR_ERASE_STAMP;
-                }
+                cursor_mode = CUR_SKIP;
             }
         }
 
@@ -1344,6 +1365,15 @@ void wm_composite(void) {
     net_popup_draw();
     vol_popup_draw();
     alttab_draw();
+
+    /* Publish the shadow frame BEFORE the overlay stamps below — they
+     * draw on the visible buffer and their save-unders must capture the
+     * final frame, not the pre-blit one (stale save-unders painted
+     * pointer-sized ghost squares on the next erase). */
+    if (shadow_active) {
+        display_restore_draw();
+        memcpy(display_draw_buffer_ptr, wm_shadow, FB_STRIDE * FB_HEIGHT);
+    }
 
     /* Stamp drag outline on visible buffer (before cursor) */
     {

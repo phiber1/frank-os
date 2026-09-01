@@ -7,6 +7,7 @@
  */
 
 #include "startmenu.h"
+#include "../drivers/psram/psram.h"
 #include "taskbar.h"
 #include "window.h"
 #include "window_event.h"
@@ -257,6 +258,17 @@ static bool  sm_open = false;
 static int8_t sm_hover = -1;
 static int16_t sm_x, sm_y, sm_w, sm_h;
 
+/* Main-panel save-under + deferred close-restore.  Closing restores the
+ * saved pixels instead of wm_force_full_repaint() — a full repaint on a
+ * single-buffered display is a visible whole-screen white flash.  All
+ * framebuffer writes stay on the COMPOSITOR task: startmenu_close()
+ * (input task) only requests the restore; startmenu_draw() performs it. */
+static uint8_t *sm_main_su_buf = NULL;
+static int      sm_main_su_cap = 0;
+static int16_t  sm_main_x, sm_main_y, sm_main_w, sm_main_h;
+static bool     sm_main_valid = false;
+static volatile bool sm_restore_pending = false;
+
 /* Programs submenu state */
 static bool   sub_open = false;
 static int8_t sub_hover = -1;
@@ -292,8 +304,16 @@ static bool     sm_ctx_su_valid = false;
 /* Ensure a heap buffer has enough room; (re)alloc if needed. */
 static bool su_ensure(uint8_t **buf, int *cap, int need) {
     if (*cap >= need) return true;
-    if (*buf) vPortFree(*buf);
-    *buf = (uint8_t *)pvPortMalloc(need);
+    if (*buf) psram_free(*buf);          /* handles SRAM pointers too */
+    /* PSRAM first: submenu save-unders can be tens of KB, and the SRAM
+     * heap can't supply that with a big app running — the old
+     * pvPortMalloc failure fell back to wm_force_full_repaint() on
+     * EVERY submenu hover change (violent full-screen flashing). */
+    *buf = NULL;
+    if (psram_is_available())
+        *buf = (uint8_t *)psram_alloc(need);
+    if (!*buf)
+        *buf = (uint8_t *)pvPortMalloc(need);
     *cap = *buf ? need : 0;
     return *buf != NULL;
 }
@@ -440,19 +460,21 @@ void startmenu_close(void) {
     set_hover = -1;
     sm_ctx_hover = -1;
     sm_ctx_app_idx = -1;
-    /* Free save-under buffers — full repaint restores everything */
-    sm_su_valid = false;
-    sm_su_which = 0;
-    sm_ctx_su_valid = false;
-    if (sm_su_buf)     { vPortFree(sm_su_buf);     sm_su_buf = NULL;     sm_su_cap = 0; }
-    if (sm_ctx_su_buf) { vPortFree(sm_ctx_su_buf); sm_ctx_su_buf = NULL; sm_ctx_su_cap = 0; }
-    /* Force full repaint to guarantee stale menu pixels are cleared,
-     * even if the popup-close transition detector misses the change. */
-    wm_force_full_repaint();
+    /* Defer pixel restoration to the compositor (startmenu_draw):
+     * this runs on the input task and must not touch the framebuffer. */
+    sm_restore_pending = true;
+    wm_mark_dirty();
 }
 
 bool startmenu_is_open(void) {
     return sm_open;
+}
+
+/* True while a deferred close-restore is queued for startmenu_draw().
+ * The WM's popup-close transition detector skips its full-repaint
+ * fallback in that case — the menu erases itself via save-under. */
+bool startmenu_restore_pending(void) {
+    return sm_restore_pending;
 }
 
 /*==========================================================================
@@ -477,7 +499,11 @@ extern const uint8_t *clock_icon16_get(void);
 static void execute_sub_item(int index) {
     startmenu_close();
     cursor_set_type(CURSOR_WAIT);
-    wm_composite();  /* flush frame so hourglass is visible during load */
+    /* Let the COMPOSITOR task render the hourglass frame: calling
+     * wm_composite() directly from the input task raced the concurrent
+     * compositor cycle (ghost menus left behind ~50% of launches). */
+    wm_mark_dirty();
+    vTaskDelay(3);
     extern const uint8_t default_icon_16x16[256];
     if (index < fos_app_count) {
         wm_set_pending_icon(fos_apps[index].has_icon
@@ -508,7 +534,8 @@ static void execute_sub_item(int index) {
 
 static void do_flash_firmware(int index) {
     cursor_set_type(CURSOR_WAIT);
-    wm_composite();
+    wm_mark_dirty();
+    vTaskDelay(3);   /* compositor renders the frame — see execute_sub_item */
 
     /* Shut down the sound system to prevent noise/clicks during flash */
     snd_deinit();
@@ -676,7 +703,47 @@ static void draw_sidebar_logo(int sx, int sy, int bar_w, int bar_h) {
 }
 
 void startmenu_draw(void) {
-    if (!sm_open) return;
+    if (!sm_open) {
+        if (sm_restore_pending) {
+            sm_restore_pending = false;
+            /* Restore in reverse draw order: context popup, submenu,
+             * then the main panel. */
+            if (sm_ctx_su_valid) {
+                fb_restore(sm_ctx_su_buf, sm_ctx_su_x, sm_ctx_su_y,
+                           sm_ctx_su_w, sm_ctx_su_h);
+                sm_ctx_su_valid = false;
+            }
+            if (sm_su_valid) {
+                fb_restore(sm_su_buf, sm_su_x, sm_su_y, sm_su_w, sm_su_h);
+                sm_su_valid = false;
+            }
+            sm_su_which = 0;
+            if (sm_main_valid) {
+                fb_restore(sm_main_su_buf, sm_main_x, sm_main_y,
+                           sm_main_w, sm_main_h);
+                sm_main_valid = false;
+            } else {
+                /* No main save-under (alloc failed) — fall back */
+                wm_force_full_repaint();
+            }
+            if (sm_su_buf)     { psram_free(sm_su_buf);     sm_su_buf = NULL;     sm_su_cap = 0; }
+            if (sm_ctx_su_buf) { psram_free(sm_ctx_su_buf); sm_ctx_su_buf = NULL; sm_ctx_su_cap = 0; }
+            if (sm_main_su_buf){ psram_free(sm_main_su_buf); sm_main_su_buf = NULL; sm_main_su_cap = 0; }
+            taskbar_force_dirty();
+        }
+        return;
+    }
+    /* First draw after opening: save the pixels under the main panel
+     * (the frame is clean here — the cursor stamp is erased before the
+     * paint phase whenever anything is dirty). */
+    if (!sm_main_valid) {
+        if (fb_save(&sm_main_su_buf, &sm_main_su_cap,
+                    sm_x, sm_y, sm_w, sm_h)) {
+            sm_main_x = sm_x; sm_main_y = sm_y;
+            sm_main_w = sm_w; sm_main_h = sm_h;
+            sm_main_valid = true;
+        }
+    }
     /* Refresh text pointers on every draw so language changes take effect */
     sm_refresh_text();
 
@@ -684,9 +751,17 @@ void startmenu_draw(void) {
      * Track which submenu is open by identity (not just rect) so that
      * overlapping rects between different submenus are always handled.
      * Restore old → save new → draw.  On steady-state frames (same
-     * submenu, same rect) the save/restore is skipped for speed. */
+     * submenu, same rect) the save/restore is skipped for speed.
+     *
+     * The open flags are SNAPSHOTTED once per draw pass: the input task
+     * flips them on hover at any moment, and if the flag changes
+     * between this capture and the draw sections below, a submenu gets
+     * painted whose pixels were never saved — the close-restore then
+     * leaves a partial ghost of it on the desktop. */
+    uint8_t draw_which = sub_open ? 1 : fw_open ? 2 : set_open ? 3 : 0;
+    bool    draw_ctx   = sm_ctx_open;
     {
-        uint8_t cur_which = sub_open ? 1 : fw_open ? 2 : set_open ? 3 : 0;
+        uint8_t cur_which = draw_which;
         int16_t cx = 0, cy = 0, cw = 0, ch = 0;
         if (cur_which == 1) { cx = sub_x; cy = sub_y; cw = sub_w; ch = sub_h; }
         if (cur_which == 2) { cx = fw_x;  cy = fw_y;  cw = fw_w;  ch = fw_h;  }
@@ -718,7 +793,7 @@ void startmenu_draw(void) {
     }
 
     /* --- Save-under for context popup --- */
-    if (sm_ctx_open && !sm_ctx_su_valid) {
+    if (draw_ctx && !sm_ctx_su_valid) {
         if (fb_save(&sm_ctx_su_buf, &sm_ctx_su_cap,
                     sm_ctx_x, sm_ctx_y, sm_ctx_w, sm_ctx_h)) {
             sm_ctx_su_x = sm_ctx_x; sm_ctx_su_y = sm_ctx_y;
@@ -726,7 +801,7 @@ void startmenu_draw(void) {
             sm_ctx_su_valid = true;
         }
     }
-    if (!sm_ctx_open && sm_ctx_su_valid) {
+    if (!draw_ctx && sm_ctx_su_valid) {
         fb_restore(sm_ctx_su_buf,
                    sm_ctx_su_x, sm_ctx_su_y, sm_ctx_su_w, sm_ctx_su_h);
         sm_ctx_su_valid = false;
@@ -778,8 +853,8 @@ void startmenu_draw(void) {
         iy += SM_ITEM_HEIGHT;
     }
 
-    /* Draw Programs submenu if open */
-    if (sub_open) {
+    /* Draw Programs submenu if open (snapshot — see draw_which above) */
+    if (draw_which == 1) {
         int sub_count = fos_app_count + 2; /* apps + Terminal */
         gfx_fill_rect(sub_x, sub_y, sub_w, sub_h, THEME_BUTTON_FACE);
         gfx_hline(sub_x, sub_y, sub_w, COLOR_WHITE);
@@ -815,8 +890,8 @@ void startmenu_draw(void) {
         }
     }
 
-    /* Draw Firmware submenu if open */
-    if (fw_open) {
+    /* Draw Firmware submenu if open (snapshot) */
+    if (draw_which == 2) {
         gfx_fill_rect(fw_x, fw_y, fw_w, fw_h, THEME_BUTTON_FACE);
         gfx_hline(fw_x, fw_y, fw_w, COLOR_WHITE);
         gfx_vline(fw_x, fw_y, fw_h, COLOR_WHITE);
@@ -840,8 +915,8 @@ void startmenu_draw(void) {
         }
     }
 
-    /* Draw Settings submenu if open */
-    if (set_open) {
+    /* Draw Settings submenu if open (snapshot) */
+    if (draw_which == 3) {
         gfx_fill_rect(set_x, set_y, set_w, set_h, THEME_BUTTON_FACE);
         gfx_hline(set_x, set_y, set_w, COLOR_WHITE);
         gfx_vline(set_x, set_y, set_h, COLOR_WHITE);
@@ -886,8 +961,8 @@ void startmenu_draw(void) {
         }
     }
 
-    /* Draw right-click context popup (if open) */
-    if (sm_ctx_open) {
+    /* Draw right-click context popup (if open — snapshot) */
+    if (draw_ctx) {
         gfx_fill_rect(sm_ctx_x, sm_ctx_y, sm_ctx_w, sm_ctx_h,
                        THEME_BUTTON_FACE);
         gfx_hline(sm_ctx_x, sm_ctx_y, sm_ctx_w, COLOR_WHITE);

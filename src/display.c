@@ -324,6 +324,27 @@ void display_swap_buffers(void) {
     /* No-op: single-buffer mode — kept for sys_table backward compat */
 }
 
+/* Temporarily redirect ALL drawing (draw_buffer + the public fast-path
+ * pointer) to an offscreen target.  Used by the WM to render full
+ * repaints into a PSRAM shadow and blit the finished frame — a full
+ * repaint painted live on the single buffer is a visible white flash. */
+static uint8_t *redirect_saved = NULL;
+
+void display_redirect_draw(uint8_t *target) {
+    if (!redirect_saved)
+        redirect_saved = draw_buffer;
+    draw_buffer = target;
+    display_draw_buffer_ptr = target;
+}
+
+void display_restore_draw(void) {
+    if (redirect_saved) {
+        draw_buffer = redirect_saved;
+        display_draw_buffer_ptr = redirect_saved;
+        redirect_saved = NULL;
+    }
+}
+
 void display_wait_vsync(void) {
     DispHstxWaitVSync();
 }

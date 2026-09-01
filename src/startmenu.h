@@ -23,6 +23,7 @@ void startmenu_close(void);
 
 /* Is the start menu currently open? */
 bool startmenu_is_open(void);
+bool startmenu_restore_pending(void);
 
 /* Draw the start menu as a compositor overlay */
 void startmenu_draw(void);

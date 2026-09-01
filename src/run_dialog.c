@@ -991,7 +991,8 @@ void run_dialog_check_pending(void) {
             spawn_filemanager_window();
         } else if (what == RD_LAUNCH_FILE) {
             cursor_set_type(CURSOR_WAIT);
-            wm_composite();
+            wm_mark_dirty();
+            vTaskDelay(3);   /* compositor renders — do not composite on input task */
             if (!file_assoc_open(rd_pending_launch_path)) {
                 /* Check if this is a cc-compiled executable (.xa1 sidecar) */
                 char xa1[RD_CMD_MAX + 4];

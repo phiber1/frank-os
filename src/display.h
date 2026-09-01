@@ -68,6 +68,10 @@ void display_set_palette_entry(uint8_t index, uint32_t rgb888);
 void display_set_pixel(int x, int y, uint8_t color);
 void display_clear(uint8_t color);
 void display_swap_buffers(void);
+
+/* Offscreen redirect for flicker-free full repaints (see display.c) */
+void display_redirect_draw(uint8_t *target);
+void display_restore_draw(void);
 void display_wait_vsync(void);
 uint16_t display_get_scanline(void);
 void display_wait_scanline(int16_t y);

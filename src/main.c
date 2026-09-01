@@ -488,7 +488,10 @@ static void compositor_task(void *params) {
             taskbar_init();
             cursor_set_type(CURSOR_ARROW);
             cursor_overlay_erase();
-            boot_cursor_hidden = true;
+            /* Show the arrow immediately — hiding it until the first
+             * mouse movement made the pointer seem to vanish after the
+             * boot hourglass. */
+            boot_cursor_hidden = false;
             wm_force_full_repaint();
             /* Focus desktop if shortcuts exist and no windows are open */
             if (desktop_has_shortcuts()) desktop_focus();
@@ -1077,6 +1080,12 @@ int main(void) {
      * → flash 0xC00000–0xFFFFFF) so the sys_table at 0x10FFF000 works. */
     qmi_hw->atrans[3] = (0x400u << QMI_ATRANS3_SIZE_LSB)
                        | (0xC00u << QMI_ATRANS3_BASE_LSB);
+
+    /* DispHSTX hardcodes DMA channels 14 (cmd) and 15 (data) without
+     * claiming them through the SDK.  Claim them here, before any driver
+     * calls dma_claim_unused_channel(), so nothing can ever collide with
+     * the scanline engine. */
+    dma_claim_mask((1u << 14) | (1u << 15));
 
     /* Clear SRAM UI-force magic left over from Space-escape boot */
     *SRAM_UIFORCE_ADDR = 0;
