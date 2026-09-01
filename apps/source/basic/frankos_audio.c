@@ -233,6 +233,12 @@ static int synth_tone_chunk(int16_t *buf, int nframes) {
             ri = ((int)SineTable[accr >> 12] - 2000) * mr / 128;
             accr = (accr + incr) & 0xFFFFFF;
         }
+        /* declick: fade the last ~3 ms — cutting the sine mid-swing at
+         * full amplitude put a hard step (loud click) on every tone end */
+        if (SoundPlay < 128) {
+            li = li * (int)SoundPlay / 128;
+            ri = ri * (int)SoundPlay / 128;
+        }
         buf[n * 2]     = (int16_t)li;
         buf[n * 2 + 1] = (int16_t)ri;
         n++;
@@ -418,16 +424,34 @@ static int decode_chunk(void) {
 
 static void audio_pump_task(void *param) {
     (void)param;
-    int chan_open = 0, chan_rate = 0;
+    int chan_open = 0, chan_rate = 0, linger = 0;
     for (;;) {
         e_CurrentlyPlaying st = CurrentlyPlaying;
         int want_rate = (st == P_TONE || st == P_SOUND) ? 44100 :
                         (st == P_WAV || st == P_MP3 || st == P_FLAC || st == P_MOD)
                             ? src_rate : 0;
         if (want_rate == 0) {
-            /* idle, paused or stopped: park with the channel closed */
+            /* Idle, paused or stopped.  After NATURAL completion the
+             * channel lingers open briefly: closing it immediately
+             * raced the OS mixer's DMA and swallowed short tones (the
+             * 15-25ms rotate/lock blips were usually silent, sometimes
+             * audible half-way).  The linger also lets back-to-back
+             * tones start instantly.  An explicit stop (P_STOP) still
+             * closes at once so StopAudio() stays fast. */
             if (chan_open) {
-                os_pcm_cleanup(); chan_open = 0;
+                if (st == P_STOP || --linger <= 0) {
+                    os_pcm_cleanup(); chan_open = 0;
+                }
+            }
+            if (chan_open) {                 /* lingering: feed SILENCE.
+                 * An open-but-starving channel underruns the OS mixer
+                 * for the whole linger — audible clicks and, worse, the
+                 * underrun path stalls the system (rotate/drop input
+                 * felt ~a third of a second dead after every tone). */
+                memset(pump_buf, 0, sizeof(pump_buf));
+                os_pcm_write(pump_buf, PUMP_CHUNK);
+                vTaskDelay(1);
+                continue;
             }
             pump_idle = 1;
             if (pump_kill) {                 /* app is exiting */
@@ -444,6 +468,7 @@ static void audio_pump_task(void *param) {
             chan_open = 1;
             chan_rate = want_rate;
         }
+        linger = 150;                        /* ~300ms idle grace */
 
         vTaskDelay(1);   /* hard pacing: never spin, even channel-less */
         if (st == P_TONE) {

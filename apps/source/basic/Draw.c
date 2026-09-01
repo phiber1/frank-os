@@ -13314,6 +13314,17 @@ void closeframebuffer(char layer)
     SecondLayer = (unsigned char *)FRAMEBUFFER;
     SecondFrame = (unsigned char *)FRAMEBUFFER;
     transparent = 0;
+#ifdef _FRANKOS
+    /* FRANKOS has no physical display buffer — FRAMEBUFFER is NULL here,
+     * and leaving WriteBuf NULL makes SPRITE (and friends) refuse to run
+     * ("Not available on physical display") after any path that closes
+     * framebuffers (NEW/LOAD).  The memory gfx layer is the permanent
+     * draw target — re-pin it. */
+    if (WriteBuf == NULL) {
+        extern unsigned char *basic_gfx_buf;
+        WriteBuf = basic_gfx_buf;
+    }
+#endif
 }
 /*  @endcond */
 

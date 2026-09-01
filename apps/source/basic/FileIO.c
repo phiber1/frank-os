@@ -5277,6 +5277,10 @@ void MIPS16 cmd_files(void)
     SetFont(oldfont);
     int i, c, dirs, currentsize;
     static int ListCnt = 2;
+    if (Option.DISPLAY_CONSOLE)   /* fresh count from the cursor row (the
+                                     static 2 kept stale state between
+                                     FILES calls and paused early) */
+        ListCnt = CurrentY / (FontTable[gui_font >> 4][1] * (gui_font & 0b1111));
     uint32_t currentdate;
     char *p, extension[8];
     int fcnt, sortorder = 0;
@@ -5733,8 +5737,10 @@ void MIPS16 cmd_files(void)
                 ClearScreen(gui_bcolour);
                 CurrentX = 0;
                 CurrentY = 0;
+                ListCnt = 0;   /* cleared to row 0 — see ListNewLine */
             }
-            ListCnt = 2;
+            else
+                ListCnt = 2;
         }
     }
     // display the summary

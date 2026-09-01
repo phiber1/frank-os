@@ -1021,7 +1021,9 @@ void MIPS16 ListFile(char *pp, int all)
 {
 	char buff[STRINGSIZE];
 	int fnbr;
-	int i, ListCnt = CurrentY / (FontTable[gui_font >> 4][1] * (gui_font & 0b1111)) + 2;
+	/* On the display console the count is the cursor's row — the +2
+	 * scrolling-serial bias made the FIRST page pause two lines early. */
+	int i, ListCnt = CurrentY / (FontTable[gui_font >> 4][1] * (gui_font & 0b1111)) + (Option.DISPLAY_CONSOLE ? 0 : 2);
 	fnbr = FindFreeFileNbr();
 	if (!BasicFileOpen(pp, fnbr, FA_READ))
 		return;
@@ -1059,8 +1061,14 @@ void MIPS16 ListNewLine(int *ListCnt, int all)
 			ClearScreen(gui_bcolour);
 			CurrentX = 0;
 			CurrentY = 0;
+			/* Cleared to row 0: restart the line count at 0.  The
+			 * upstream reset of 2 belongs to the scrolling-serial flow
+			 * and made every page pause two lines early (the prompt sat
+			 * three rows above the bottom). */
+			*ListCnt = 0;
 		}
-		*ListCnt = 2;
+		else
+			*ListCnt = 2;
 	}
 	Option.NoScroll = noscroll;
 }
@@ -1069,7 +1077,7 @@ void MIPS16 ListProgram(unsigned char *p, int all)
 {
 	char b[STRINGSIZE];
 	char *pp;
-	int ListCnt = CurrentY / (FontTable[gui_font >> 4][1] * (gui_font & 0b1111)) + 2;
+	int ListCnt = CurrentY / (FontTable[gui_font >> 4][1] * (gui_font & 0b1111)) + (Option.DISPLAY_CONSOLE ? 0 : 2);
 	while (!(*p == 0 || *p == 0xff))
 	{ // normally a LIST ends at the break so this is a safety precaution
 		if (*p == T_NEWLINE)
@@ -1711,7 +1719,7 @@ void cmd_help(void)
 		int fnbr = FindFreeFileNbr();
 		char *buff = GetTempStrMemory();
 		BasicFileOpen("B:/help.txt", fnbr, FA_READ);
-		int ListCnt = CurrentY / (FontTable[gui_font >> 4][1] * (gui_font & 0b1111)) + 2;
+		int ListCnt = CurrentY / (FontTable[gui_font >> 4][1] * (gui_font & 0b1111)) + (Option.DISPLAY_CONSOLE ? 0 : 2);
 		char *p = (char *)getCstring(argv[0]);
 		bool end = false;
 		while (!FileEOF(fnbr))

@@ -265,6 +265,12 @@ static void gfx_DrawBufferFast(int x1, int y1, int x2, int y2, int blank,
 
 static void gfx_ScrollLCD(int lines)
 {
+    /* Editor scrolls are whole text rows: keep the cell layer in sync
+     * (the console's own output path scrolls cells internally and never
+     * calls ScrollLCD, so graphics stay put under scrolling REPL text). */
+    extern void basic_tbuf_scroll_rows(int rows);
+    if (lines > 0 && (lines & 15) == 0)
+        basic_tbuf_scroll_rows(lines >> 4);
     if (lines == 0) return;
     if (lines > 0 && lines < GFX_H) {
         memmove(basic_gfx_buf, basic_gfx_buf + lines * GFX_BPR,

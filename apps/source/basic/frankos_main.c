@@ -93,6 +93,9 @@ static volatile dirty_rect_t g_dirty[DIRTY_MAX];
 static volatile int  g_dirty_n    = 0;
 static volatile bool g_force_full = true;
 
+/* Paint progress phase — see TEMP DIAG note at its definition site. */
+extern volatile int g_paint_phase;
+
 /* Closing flag and MMAbort — also read by frankos_platform.c */
 volatile bool             g_closing = false;
 
@@ -164,8 +167,15 @@ void basic_yield(void)
  * rects — a single union rect made the paint cost scale with the SPAN
  * between two sprites, which grew as their phases drifted (the
  * "smoothness decays over minutes, re-RUN fixes it" symptom). */
+/* Bumped on every mark: the flush timer defers the repaint until a tick
+ * passes with no NEW drawing, so a multi-statement update burst (e.g. a
+ * game moving a piece: draw new cells, erase old) lands as ONE frame
+ * instead of the timer catching it half-done. */
+static volatile uint32_t g_mark_gen;
+
 static void mark_cells(int r0, int c0, int r1, int c1)
 {
+    g_mark_gen++;
     if (r0 < 0) r0 = 0;
     if (c0 < 0) c0 = 0;
     if (r1 >= BASIC_ROWS) r1 = BASIC_ROWS - 1;
@@ -220,6 +230,23 @@ static void tbuf_clear(void)
 /* Non-static wrapper so frankos_platform.c's ClearScreen() can call it
  * without needing to know the cell_t type or g_textbuf's pointer type. */
 void basic_tbuf_clear(void) { tbuf_clear(); }
+
+/* Scroll the text-cell grid by whole rows (positive = up).  Used by the
+ * editor's ScrollLCD path so both the pixel layer and the cell layer
+ * move together. */
+void basic_tbuf_scroll_rows(int rows)
+{
+    if (rows <= 0 || rows >= BASIC_ROWS) return;
+    for (int r = 0; r < BASIC_ROWS - rows; r++)
+        for (int c = 0; c < BASIC_COLS; c++)
+            g_textbuf[r][c] = g_textbuf[r + rows][c];
+    for (int r = BASIC_ROWS - rows; r < BASIC_ROWS; r++)
+        for (int c = 0; c < BASIC_COLS; c++) {
+            g_textbuf[r][c].ch   = ' ';
+            g_textbuf[r][c].attr = DEFAULT_ATTR;
+        }
+    mark_cells(0, 0, BASIC_ROWS - 1, BASIC_COLS - 1);
+}
 
 static void tbuf_scroll_up(void)
 {
@@ -540,6 +567,7 @@ done:
  */
 static void basic_paint(hwnd_t hwnd)
 {
+    g_paint_phase = 1;
     wd_begin(hwnd);
 
     /* Query the WM's frame-dirty verdict FIRST: if this dispatch follows
@@ -565,6 +593,7 @@ static void basic_paint(hwnd_t hwnd)
             held_paints++;
             g_disp_dirty = true;
             g_gfx_paint_skipped = true;   /* compound exit repays: sync */
+            g_paint_phase = 0;
             wd_end();
             return;
         }
@@ -582,9 +611,11 @@ static void basic_paint(hwnd_t hwnd)
         y_off = (DISPLAY_HEIGHT - BASIC_CLIENT_H) / 2;  /* 48 */
     }
 
+    g_paint_phase = 2;
     int16_t stride;
     uint8_t *dst = wd_fb_ptr(x_off, y_off, &stride);
     if (!dst) {
+        g_paint_phase = 0;
         wd_end();
         return;
     }
@@ -642,6 +673,7 @@ static void basic_paint(hwnd_t hwnd)
     }
 
     if (vis_cols == 0 || vis_rows == 0) {
+        g_paint_phase = 0;
         wd_end();
         return;
     }
@@ -692,6 +724,7 @@ static void basic_paint(hwnd_t hwnd)
     g_dirty_n    = 0;
     g_force_full = false;
 
+    g_paint_phase = 3;
     for (int ri = 0; ri < nrect; ri++) {
     int pr0 = rects[ri].r0, pc0 = rects[ri].c0;
     int pr1 = rects[ri].r1, pc1 = rects[ri].c1;
@@ -780,6 +813,12 @@ static void basic_paint(hwnd_t hwnd)
 
     {   /* completed paint — release any waiting basic_gfx_sync() */
         extern volatile uint32_t g_paint_serial;
+
+/* TEMP DIAG: paint progress phase, watched from basic_tick_cb (which
+ * runs on the OS timer task and stays alive even when the compositor
+ * hangs).  Non-zero for >2s => the compositor is stuck inside
+ * basic_paint at that phase. */
+volatile int g_paint_phase;
         g_paint_serial++;
     }
     wd_end();
@@ -865,6 +904,12 @@ volatile bool g_gfx_paint_skipped = false;
  * requested often landed on the NEXT sprite compound, forcing the next
  * sync too (every iteration paid the yield: "PAUSE 2 feels like 4"). */
 volatile uint32_t g_paint_serial;
+
+/* TEMP DIAG: paint progress phase, watched from basic_tick_cb (which
+ * runs on the OS timer task and stays alive even when the compositor
+ * hangs).  Non-zero for >2s => the compositor is stuck inside
+ * basic_paint at that phase. */
+volatile int g_paint_phase;
 
 void basic_gfx_sync(void)
 {
@@ -1046,13 +1091,27 @@ static void blink_cb(TimerHandle_t t)
         }
     }
     {
-        static int unfocused_skip = 0;
+        static int      unfocused_skip = 0;
+        static uint32_t last_gen = 0;
+        static int      dirty_age = 0;
         if (g_disp_dirty && g_hwnd != HWND_NULL) {
-            if (g_focused || ++unfocused_skip >= 10) {
+            /* Coalesce: hold the flush while draws are still arriving
+             * (mark generation changed since last tick), so an update
+             * burst paints once, atomically.  Cap the deferral at 3
+             * ticks (75 ms) so continuous animation still flushes. */
+            bool settled = (g_mark_gen == last_gen);
+            last_gen = g_mark_gen;
+            dirty_age++;
+            if ((settled || dirty_age >= 3) &&
+                (g_focused || ++unfocused_skip >= 10)) {
                 unfocused_skip = 0;
+                dirty_age = 0;
                 g_disp_dirty = false;
                 wm_invalidate(g_hwnd);
             }
+        } else {
+            last_gen = g_mark_gen;
+            dirty_age = 0;
         }
     }
 }
@@ -1103,8 +1162,7 @@ int main(int argc, char **argv)
     printf("[basic] wm_create_window %dx%d at (%d,%d)\n", fw, fh, x, y);
 
     g_hwnd = wm_create_window(x, y, fw, fh, "MMBasic",
-                              WSTYLE_DIALOG | WF_FULLSCREENABLE | WF_HIDE_CURSOR |
-                              WF_NOCLEAR,
+                              WSTYLE_DIALOG | WF_FULLSCREENABLE | WF_NOCLEAR,
                               basic_event, basic_paint);
     printf("[basic] g_hwnd: %p\n", (void*)(uintptr_t)g_hwnd);
     if (g_hwnd == HWND_NULL) {

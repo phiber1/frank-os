@@ -581,8 +581,12 @@ reset:
     Option.Width           = 79;  /* terminal width */
     Option.Height          = 24;  /* terminal height */
     Option.SerialConsole   = 0;   /* no UART serial console */
-    Option.NoScroll        = 1;   /* ScrollLCD is a stub — force the
-                                     editor's redraw-instead-of-scroll */
+    Option.NoScroll        = 0;   /* real scrolling: the REPL scrolls the
+                                     cell layer via DisplayPutC, and the
+                                     editor's ScrollLCD now moves both the
+                                     pixel and cell layers together.
+                                     (NoScroll=1 made the REPL CLEAR THE
+                                     SCREEN at the bottom.) */
     Option.CPU_Speed       = 150000;
 
     /* ResetOptions() reset DefaultFont to the stock 8x12-class font 0.
