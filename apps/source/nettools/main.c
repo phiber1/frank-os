@@ -655,6 +655,11 @@ out_sock:
 out_nofile:
     netcard_set_data_callback(NULL);
     netcard_set_close_callback(NULL);
+    /* Free the PSRAM ring after every transfer: the OS does not reclaim
+     * an app's psram allocations at exit, so keeping it for the session
+     * leaked 1MB per NetTools run (a day of transfers exhausted PSRAM
+     * and crashed the next big app launch). */
+    if (g_ring) { os_psram_free(g_ring); g_ring = NULL; }
     app.busy = false;
     wm_invalidate(app.hwnd);
 }
