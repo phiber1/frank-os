@@ -319,13 +319,15 @@ char *strrchr(const char *s, int c) {
  * that broke the transfer watchdog (16-bit app TickType_t vs 32-bit
  * kernel ticks). Unsigned subtraction handles the 71-min wrap. */
 #define NOW_MS()  ((*(volatile uint32_t *)0x400B0028u) / 1000u)
-#define GET_RING_SZ    65536   /* ~6s of buffering at 115200: SD card
-                                  write-latency spikes must not overflow
-                                  the ring (overflow aborts the transfer) */
+#define GET_RING_SZ    (1024u * 1024u)  /* ~11s of buffering at 921600:
+                                  SD write-latency and UI-repaint spikes
+                                  must not overflow the ring (overflow
+                                  aborts the transfer).  Allocated from
+                                  PSRAM on first Get. */
 #define GET_HDR_MAX    1024
 #define GET_TIMEOUT_MS 15000
 
-static uint8_t           g_ring[GET_RING_SZ];
+static uint8_t          *g_ring;
 static volatile uint32_t g_rhead, g_rtail;      /* head: cb writes, tail: app reads */
 static volatile bool     g_sock_closed;
 static volatile bool     g_ring_overflow;
@@ -334,7 +336,7 @@ static volatile bool     g_go;                  /* explicit start latch: stray t
                                                    notifications must NOT re-fire an op */
 
 static void get_data_cb(uint8_t id, const uint8_t *data, uint16_t len) {
-    if (id != GET_SOCK_ID) return;
+    if (id != GET_SOCK_ID || !g_ring) return;
     uint32_t head = g_rhead;
     for (uint16_t i = 0; i < len; i++) {
         uint32_t next = (head + 1) % GET_RING_SZ;
@@ -446,6 +448,10 @@ static void do_get(void) {
     snprintf(tmp, sizeof(tmp), "%s.part", dest);
 
     /* ── Connect and send the request ── */
+    if (!g_ring) {
+        g_ring = (uint8_t *)os_psram_alloc(GET_RING_SZ);
+        if (!g_ring) { get_status("PSRAM ring alloc failed"); goto out_nofile; }
+    }
     g_rhead = g_rtail = 0;
     g_sock_closed = false;
     g_ring_overflow = false;
@@ -499,7 +505,8 @@ static void do_get(void) {
             }
 
             if (g_ring_overflow) {
-                snprintf(line, sizeof(line), "Overrun at %ld bytes", received);
+                snprintf(line, sizeof(line), "Overrun at %ld bytes (%s)",
+                         received, ram_mode ? "RAM" : "SD");
                 get_status(line);
                 break;
             }
@@ -563,8 +570,9 @@ static void do_get(void) {
                             file_open = true;
                         }
                         in_body = true;
-                        snprintf(line, sizeof(line), "-> %s (%ld bytes)", dest,
-                                 content_len);
+                        snprintf(line, sizeof(line), "-> %s (%ld bytes, %s)",
+                                 dest, content_len,
+                                 ram_mode ? "RAM" : "SD");
                         get_status(line);
                         g_prog_base = textarea_get_length(&app.result_ta);
                         break;
