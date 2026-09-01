@@ -1,6 +1,9 @@
 ' TETRIS for FRANKOS MMBASIC (Fruit Jam port)
 ' Controls: left/right arrows (or A/D) move, up (or W) rotate,
 '           down (or S) soft drop, SPACE hard drop, P pause, Q quit.
+' The falling piece is a SPRITE: SPRITE SHOW moves it atomically
+' (restore + save-under + draw in one compound), so piece movement
+' cannot tear or ghost no matter how the display flush timing lands.
 OPTION DEFAULT INTEGER
 
 CONST CS = 16        ' cell size in pixels
@@ -12,13 +15,17 @@ DIM px(6, 3, 3), py(6, 3, 3)    ' piece blocks: piece, rotation, block
 DIM cc(7)                       ' piece colours (1-based into draw)
 DIM sz(6)                       ' rotation box size per piece
 DIM shp$(6)
-DIM score, lines, level, cur, rot, cx, cy, nxt, dropms, gameover
+DIM score, nlines, lvl, cur, rot, cx, cy, nxt, dropms, gameover, nclr
+DIM gspr                        ' sprite # currently shown (0 = none)
+DIM lsc(4)
+lsc(1) = 40 : lsc(2) = 100 : lsc(3) = 300 : lsc(4) = 1200
 
 ReadPieces
 cc(1) = RGB(CYAN) : cc(2) = RGB(YELLOW) : cc(3) = RGB(BLUE)
 cc(4) = RGB(255, 128, 0) : cc(5) = RGB(GREEN) : cc(6) = RGB(MAGENTA)
 cc(7) = RGB(RED)
 
+BuildSprites
 NewGame
 
 DO
@@ -38,21 +45,24 @@ DO
 LOOP
 
 SUB HandleKey k
-  LOCAL nr
+  LOCAL nr, dy
   IF k = ASC("q") OR k = ASC("Q") THEN
+    HideCur
     CLS
     ON ERROR SKIP 1
     PLAY STOP
     END
   ENDIF
   IF gameover THEN
-    IF k = ASC(" ") THEN NewGame
+    IF k = ASC(" ") AND TIMER > 500 THEN NewGame
     EXIT SUB
   ENDIF
   IF k = ASC("p") OR k = ASC("P") THEN
     Centre "* PAUSED *"
     DO : PAUSE 20 : LOOP UNTIL INKEY$ <> ""
-    RedrawWell : DrawPiece cur, rot, cx, cy
+    HideCur
+    RedrawWell
+    ShowCur
     EXIT SUB
   ENDIF
   SELECT CASE k
@@ -67,93 +77,133 @@ SUB HandleKey k
         PLAY TONE 880, 880, 15
       ELSEIF Fits(cur, nr, cx - 1, cy) THEN  ' simple wall kick
         MovePiece cx - 1, cy, nr
+        PLAY TONE 660, 660, 15               ' lower blip: kicked rotate
       ELSEIF Fits(cur, nr, cx + 1, cy) THEN
         MovePiece cx + 1, cy, nr
+        PLAY TONE 660, 660, 15
       ENDIF
     CASE &H81, ASC("s"), ASC("S")            ' soft drop
       IF Fits(cur, rot, cx, cy + 1) THEN MovePiece cx, cy + 1, rot : score = score + 1
     CASE ASC(" ")                            ' hard drop
-      DO WHILE Fits(cur, rot, cx, cy + 1)
-        cy = cy + 1 : score = score + 2
+      dy = cy
+      DO WHILE Fits(cur, rot, cx, dy + 1)
+        dy = dy + 1 : score = score + 2
       LOOP
-      ErasePiece cur, rot, cx, cy : DrawPiece cur, rot, cx, cy
+      MovePiece cx, dy, rot
       LockPiece
   END SELECT
 END SUB
 
+' ── Sprite handling for the falling piece ───────────────────────────
+SUB ShowCur
+  SPRITE SHOW #(cur * 4 + rot + 1), FX + cx * CS, FY + cy * CS, 1
+  gspr = cur * 4 + rot + 1
+END SUB
+
+SUB HideCur
+  IF gspr THEN SPRITE HIDE #gspr : gspr = 0
+END SUB
+
 SUB MovePiece nx, ny, nr
-  ErasePiece cur, rot, cx, cy
+  IF nr <> rot THEN HideCur                  ' rotation swaps sprite images
   cx = nx : cy = ny : rot = nr
-  DrawPiece cur, rot, cx, cy
+  ShowCur
 END SUB
 
 SUB LockPiece
   LOCAL i, fx, fy, n
+  HideCur
   FOR i = 0 TO 3
     fx = cx + px(cur, rot, i) : fy = cy + py(cur, rot, i)
-    IF fy >= 0 THEN w(fx, fy) = cur + 1
-    IF fy < 0 THEN gameover = 1
+    IF fy >= 0 THEN
+      w(fx, fy) = cur + 1
+      Cell fx, fy, cc(cur + 1)
+    ENDIF
   NEXT
   PLAY TONE 220, 220, 25
-  n = ClearLines()
+  DoClearLines
+  n = nclr
   IF n > 0 THEN
-    SELECT CASE n
-      CASE 1 : score = score + 40 * (level + 1)
-      CASE 2 : score = score + 100 * (level + 1)
-      CASE 3 : score = score + 300 * (level + 1)
-      CASE 4 : score = score + 1200 * (level + 1)
-    END SELECT
-    lines = lines + n
-    IF lines \ 10 > level THEN
-      level = lines \ 10
-      dropms = 600 - 50 * level
+    IF n > 4 THEN n = 4
+    score = score + lsc(n) * (lvl + 1)
+    nlines = nlines + n
+    IF nlines \ 10 > lvl THEN
+      lvl = nlines \ 10
+      dropms = 600 - 50 * lvl
       IF dropms < 80 THEN dropms = 80
       PLAY TONE 660, 660, 40 : PAUSE 50 : PLAY TONE 990, 990, 60
     ENDIF
   ENDIF
+  SpawnPiece
   IF gameover THEN
     PLAY TONE 330, 330, 200 : PAUSE 220 : PLAY TONE 165, 165, 400
     Centre "GAME OVER - SPACE for new game"
+    ' discard keys buffered during the death (a SPACE mashed on a fast
+    ' level must not instantly start a new game), and hold off restart
+    ' for the first half second
+    DO WHILE INKEY$ <> "" : LOOP
+    TIMER = 0
     EXIT SUB
   ENDIF
-  SpawnPiece
   Panel
 END SUB
 
-FUNCTION ClearLines()
-  LOCAL x, y, yy, full, n, f
-  n = 0
+' Find ALL completed rows, flash them together, then collapse them all
+' and repaint once.
+SUB DoClearLines
+  LOCAL x, y, yy, full, f, i, rows(3)
+  nclr = 0
   FOR y = 0 TO 19
     full = 1
     FOR x = 0 TO 9
       IF w(x, y) = 0 THEN full = 0 : EXIT FOR
     NEXT
     IF full THEN
-      n = n + 1
-      FOR f = 1 TO 2                          ' flash
-        BOX FX, FY + y * CS, 10 * CS, CS, , RGB(WHITE), RGB(WHITE)
-        PAUSE 40
-        BOX FX, FY + y * CS, 10 * CS, CS, , 0, 0
-        PAUSE 30
-      NEXT
+      IF nclr < 4 THEN rows(nclr) = y
+      nclr = nclr + 1
+    ENDIF
+  NEXT
+  IF nclr = 0 THEN EXIT SUB
+  FOR f = 1 TO 2
+    FOR i = 0 TO nclr - 1
+      BOX FX, FY + rows(i) * CS, 10 * CS, CS, , RGB(WHITE), RGB(WHITE)
+    NEXT
+    PAUSE 50
+    FOR i = 0 TO nclr - 1
+      BOX FX, FY + rows(i) * CS, 10 * CS, CS, , 0, 0
+    NEXT
+    PAUSE 35
+  NEXT
+  ' collapse: remove full rows bottom-up
+  y = 19
+  DO WHILE y >= 0
+    full = 1
+    FOR x = 0 TO 9
+      IF w(x, y) = 0 THEN full = 0 : EXIT FOR
+    NEXT
+    IF full THEN
       FOR yy = y TO 1 STEP -1
         FOR x = 0 TO 9
           w(x, yy) = w(x, yy - 1)
         NEXT
       NEXT
       FOR x = 0 TO 9 : w(x, 0) = 0 : NEXT
-      PLAY TONE 440 + 110 * n, 440 + 110 * n, 50
+    ELSE
+      y = y - 1
     ENDIF
-  NEXT
-  IF n > 0 THEN RedrawWell
-  ClearLines = n
-END FUNCTION
+  LOOP
+  RedrawWell
+  PLAY TONE 440 + 110 * nclr, 440 + 110 * nclr, 60
+END SUB
 
 SUB SpawnPiece
   cur = nxt : nxt = INT(RND * 7)
-  rot = 0 : cx = 3 : cy = -2
-  IF NOT Fits(cur, rot, cx, cy) THEN gameover = 1
-  DrawPiece cur, rot, cx, cy
+  rot = 0 : cx = 3 : cy = 0
+  IF NOT Fits(cur, rot, cx, cy) THEN
+    gameover = 1
+    EXIT SUB
+  ENDIF
+  ShowCur
 END SUB
 
 FUNCTION Fits(p, r, x, y)
@@ -178,20 +228,6 @@ SUB Cell x, y, c
   ENDIF
 END SUB
 
-SUB DrawPiece p, r, x, y
-  LOCAL i
-  FOR i = 0 TO 3
-    Cell x + px(p, r, i), y + py(p, r, i), cc(p + 1)
-  NEXT
-END SUB
-
-SUB ErasePiece p, r, x, y
-  LOCAL i
-  FOR i = 0 TO 3
-    Cell x + px(p, r, i), y + py(p, r, i), 0
-  NEXT
-END SUB
-
 SUB RedrawWell
   LOCAL x, y
   FOR y = 0 TO 19
@@ -206,14 +242,15 @@ SUB Panel
   TEXT 430, 40, "SCORE", , , , RGB(WHITE), 0
   TEXT 430, 60, STR$(score) + "    ", , , , RGB(YELLOW), 0
   TEXT 430, 90, "LINES", , , , RGB(WHITE), 0
-  TEXT 430, 110, STR$(lines) + "   ", , , , RGB(CYAN), 0
+  TEXT 430, 110, STR$(nlines) + "   ", , , , RGB(CYAN), 0
   TEXT 430, 140, "LEVEL", , , , RGB(WHITE), 0
-  TEXT 430, 160, STR$(level) + "   ", , , , RGB(GREEN), 0
+  TEXT 430, 160, STR$(lvl + 1) + "   ", , , , RGB(GREEN), 0
   TEXT 430, 200, "NEXT", , , , RGB(WHITE), 0
-  BOX 430, 220, 5 * CS, 5 * CS, , 0, 0
+  ' preview aligned with the label: piece cells start at x=430
+  BOX 430, 220, 4 * CS, 4 * CS, , 0, 0
   FOR i = 0 TO 3
     c = cc(nxt + 1)
-    BOX 430 + (px(nxt, 0, i) + 1) * CS, 220 + (py(nxt, 0, i) + 1) * CS, CS - 1, CS - 1, , c, c
+    BOX 430 + px(nxt, 0, i) * CS, 220 + py(nxt, 0, i) * CS, CS - 1, CS - 1, , c, c
   NEXT
 END SUB
 
@@ -223,18 +260,44 @@ END SUB
 
 SUB NewGame
   LOCAL x, y
+  HideCur
   CLS
   FOR y = 0 TO 19
     FOR x = 0 TO 9 : w(x, y) = 0 : NEXT
   NEXT
-  score = 0 : lines = 0 : level = 0 : dropms = 600 : gameover = 0
+  score = 0 : nlines = 0 : lvl = 0 : dropms = 600 : gameover = 0
   BOX FX - 3, FY - 3, 10 * CS + 6, 20 * CS + 6, 2, RGB(128, 128, 128)
   TEXT 316, 6, "T E T R I S", "C", , , RGB(CYAN), 0
-  TEXT 60, 340, "arrows/WASD  SPACE=drop  P=pause  Q=quit", , , , RGB(128, 128, 128), 0
+  TEXT 316, 368, "arrows/WASD  SPACE=drop  P=pause  Q=quit", "C", , , , RGB(128, 128, 128), 0
   nxt = INT(RND * 7)
   SpawnPiece
   Panel
   TIMER = 0
+END SUB
+
+' Build 28 sprites (7 pieces x 4 rotations) once at startup: draw each
+' shape in the top-left corner, capture it, wipe.  Black (colour 0) is
+' transparent so empty box cells never blot out neighbouring blocks.
+SUB BuildSprites
+  ' The gfx layer has no off-screen page (SPRITE READ captures the live
+  ' buffer), so the build is staged centre-screen under the banner and
+  ' reads as a piece-cycling loading animation.
+  LOCAL p, r, i, n, bx, by
+  bx = 284 : by = 200
+  CLS
+  TEXT 316, 150, "T E T R I S", "C", , , RGB(CYAN), 0
+  TEXT 316, 290, "LOADING...", "C", , , RGB(WHITE), 0
+  SPRITE SET TRANSPARENT 0
+  FOR p = 0 TO 6
+    FOR r = 0 TO 3
+      n = p * 4 + r + 1
+      BOX bx, by, 4 * CS, 4 * CS, , 0, 0
+      FOR i = 0 TO 3
+        BOX bx + px(p, r, i) * CS, by + py(p, r, i) * CS, CS - 1, CS - 1, , cc(p + 1), cc(p + 1)
+      NEXT
+      SPRITE READ #n, bx, by, 4 * CS, 4 * CS
+    NEXT
+  NEXT
 END SUB
 
 SUB ReadPieces
