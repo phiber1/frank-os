@@ -331,13 +331,12 @@ float  sqrtf(float x) {
 double sqrt(double x) {
     typedef double(*fn)(double); return ST(203,fn)(x); }
 
-/* ARM EABI 64-bit signed division: (dividend/divisor) → r0:r1, remainder r2:r3
- * Route through sys_table[279] which contains the OS's __aeabi_ldivmod. */
-typedef struct { long long quot; unsigned long long rem; } ldivmod_t;
-ldivmod_t __aeabi_ldivmod(long long num, long long denom) {
-    typedef ldivmod_t(*fn)(long long, long long);
-    return ST(279,fn)(num, denom);
-}
+/* ARM EABI 64-bit division (__aeabi_ldivmod / __aeabi_uldivmod) comes
+ * from api/m-os-api-math.c, which implements the SPECIAL EABI register
+ * convention (quotient r0:r1 AND remainder r2:r3) in naked asm.  A
+ * struct-return C wrapper used to live here — it shifted every
+ * register and corrupted every MMBasic '\' and MOD on 64-bit values
+ * (the tetris "lvl = 0x03333F40xxxxxxxx" bug). */
 
 /* Complex math stubs — MMBasic's complex support rarely used at startup */
 #define CSTUB_F(name)  float  name##f(float _Complex z) { (void)z; return 0.f; }
