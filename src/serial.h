@@ -26,6 +26,16 @@ void serial_set_pins(uint8_t rx_pin, uint8_t tx_pin);
 
 /* Currently active RX/TX GPIO pins. */
 uint8_t serial_get_rx_pin(void);
+void serial_set_baud(uint32_t baud);
+uint32_t serial_get_baud(void);
+
+/* Total bytes consumed from the RX ring since boot (diagnostics). */
+extern volatile uint32_t serial_rx_total_bytes;
+
+/* RX stage diagnostics: ring high-water marks and loss counters. */
+void serial_rx_stats_reset(void);
+void serial_rx_stats(uint32_t *sram_hwm, uint32_t *psram_hwm,
+                     uint32_t *overruns, uint32_t *dropped);
 uint8_t serial_get_tx_pin(void);
 
 /* Send a single character */

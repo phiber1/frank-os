@@ -99,6 +99,33 @@ static nc_state_t   state;
 static char          line_buf[NC_LINE_BUF_SIZE];
 static uint16_t      line_pos;
 
+/* Byte-accounting diagnostics: compare wire bytes (serial layer) against
+ * delivered +SRECV payload to localize loss.  wire ≈ payload + ~18/chunk
+ * overhead → the C6 never sent the rest; wire ≫ payload + overhead →
+ * bytes arrived but the parser mis-framed them. */
+static uint32_t nc_payload_total, nc_chunk_total, nc_desync_events;
+static bool     nc_in_desync;
+static bool     nc_stats_printed;
+
+/* Print the per-connection byte accounting + ring diagnostics.  Called
+ * from both close paths (local AT+SCLOSE and async +SCLOSED) — once. */
+static void nc_print_stats(void) {
+    if (nc_stats_printed || nc_payload_total == 0)
+        return;
+    nc_stats_printed = true;
+    uint32_t shwm, phwm, ovr, drp;
+    serial_rx_stats(&shwm, &phwm, &ovr, &drp);
+    printf("[NC] stats: wire=%u payload=%u chunks=%u overhead=%d baud=%u\n"
+           "[NC] rings: sram_hwm=%u/8192 psram_hwm=%u/1048576 "
+           "overruns=%u dropped=%u desyncs=%u\n",
+           (unsigned)serial_rx_total_bytes, (unsigned)nc_payload_total,
+           (unsigned)nc_chunk_total,
+           (int)(serial_rx_total_bytes - nc_payload_total),
+           (unsigned)serial_get_baud(),
+           (unsigned)shwm, (unsigned)phwm, (unsigned)ovr, (unsigned)drp,
+           (unsigned)nc_desync_events);
+}
+
 /* Binary receive state (NCS_READDATA) — heap-allocated to save BSS */
 static uint8_t      *srecv_buf;
 static uint16_t      data_remaining;
@@ -174,13 +201,48 @@ static void nc_send_cmd(const char *cmd) {
 /* Line dispatcher                                                            */
 /* -------------------------------------------------------------------------- */
 
+/* Log a received line with control bytes hex-escaped.  Raw line noise
+ * (e.g. framing garbage during a baud switch) can contain terminal
+ * escape sequences that silently wedge the user's console emulator —
+ * output keeps flowing but the terminal stops rendering it. */
+static void nc_log_rx_line(const char *line) {
+    /* Hard rate-limit: a stream desync can spray hundreds of garbage
+     * lines per second, and that printf flood loads the USB console
+     * path exactly when the RX machinery is under full-rate stress —
+     * the logging itself can then perpetuate the loss cascade. */
+    static uint32_t win_start, win_count, suppressed;
+    uint32_t now = xTaskGetTickCount();
+    if ((uint32_t)(now - win_start) > pdMS_TO_TICKS(1000)) {
+        if (suppressed)
+            printf("[NC RX] ... %u lines suppressed\n", (unsigned)suppressed);
+        win_start = now;
+        win_count = 0;
+        suppressed = 0;
+    }
+    if (++win_count > 25) {
+        suppressed++;
+        return;
+    }
+    char buf[100];
+    unsigned n = 0;
+    for (const char *p = line; *p && n < sizeof(buf) - 5; p++) {
+        unsigned char c = (unsigned char)*p;
+        if (c >= 0x20 && c < 0x7f)
+            buf[n++] = (char)c;
+        else
+            n += (unsigned)snprintf(&buf[n], 5, "\\x%02x", c);
+    }
+    buf[n] = 0;
+    printf("[NC RX] %s\n", buf);
+}
+
 static void nc_process_line(const char *line, uint16_t len) {
     /* Do NOT log per-chunk +SRECV lines: an 840KB transfer emits 800+ of
      * them, and if the USB CDC console backs up, printf BLOCKS this task
      * — the very task that delivers socket data — starving the receiving
      * app into a timeout while the C6 keeps streaming. */
     if (strncmp(line, "+SRECV:", 7) != 0)
-        printf("[NC RX] %s\n", line);
+        nc_log_rx_line(line);
 
     /* ---- Final responses ---- */
 
@@ -217,26 +279,37 @@ static void nc_process_line(const char *line, uint16_t len) {
         return;
     }
 
-    /* +SRECV:id,len — switch to binary-read mode */
-    if (strncmp(line, "+SRECV:", 7) == 0) {
-        const char *p = line + 7;
-        unsigned int id = parse_uint(p, &p);
-        if (*p == ',') p++;
-        unsigned int dlen = parse_uint(p, NULL);
-        if (id < NC_MAX_SOCKETS) {
-            if (dlen > NC_SRECV_BUF_SIZE)
-                dlen = NC_SRECV_BUF_SIZE;
-            data_socket_id = (uint8_t)id;
-            data_remaining = (uint16_t)dlen;
-            data_pos = 0;
-            state = NCS_READDATA;
+    /* +SRECV:id,len — switch to binary-read mode.  The marker is also
+     * accepted MID-line: a lost byte mid-payload shifts stream framing,
+     * so the next real header lands behind payload-tail garbage and a
+     * prefix match misses it — without this, one lost byte garbles the
+     * whole rest of the connection.  A resynced transfer has a hole;
+     * receivers detect that via content-length. */
+    {
+        const char *sync = (strncmp(line, "+SRECV:", 7) == 0)
+                         ? line : strstr(line, "+SRECV:");
+        if (sync) {
+            const char *p = sync + 7;
+            unsigned int id = parse_uint(p, &p);
+            if (*p == ',') p++;
+            unsigned int dlen = parse_uint(p, NULL);
+            if (id < NC_MAX_SOCKETS && dlen > 0) {
+                if (dlen > NC_SRECV_BUF_SIZE)
+                    dlen = NC_SRECV_BUF_SIZE;
+                data_socket_id = (uint8_t)id;
+                data_remaining = (uint16_t)dlen;
+                data_pos = 0;
+                state = NCS_READDATA;
+                nc_in_desync = false;
+            }
+            return;
         }
-        return;
     }
 
     /* +SCLOSED:id — peer closed socket */
     if (strncmp(line, "+SCLOSED:", 9) == 0) {
         unsigned int id = parse_uint(line + 9, NULL);
+        nc_print_stats();
         if (id < NC_MAX_SOCKETS && cb_close)
             cb_close((uint8_t)id);
         return;
@@ -337,7 +410,19 @@ static void nc_process_line(const char *line, uint16_t len) {
     }
 
     (void)len;
-    /* Unknown lines are silently ignored */
+    /* Unknown lines are silently ignored — but an unknown line while
+     * payload has been flowing (and we were in sync) marks the exact
+     * moment stream framing was lost.  Timestamp each loss event with
+     * the byte accounting; the +SRECV resync above ends the event. */
+    if (nc_payload_total > 0 && !nc_in_desync) {
+        nc_in_desync = true;
+        if (nc_desync_events < 8)
+            printf("[NC] DESYNC #%u at wire=%u payload=%u chunks=%u\n",
+                   (unsigned)nc_desync_events + 1,
+                   (unsigned)serial_rx_total_bytes,
+                   (unsigned)nc_payload_total, (unsigned)nc_chunk_total);
+        nc_desync_events++;
+    }
 }
 
 /* -------------------------------------------------------------------------- */
@@ -387,8 +472,10 @@ static void netcard_poll_locked(void) {
 
         case NCS_READDATA:
             srecv_buf[data_pos++] = c;
+            nc_payload_total++;
             data_remaining--;
             if (data_remaining == 0) {
+                nc_chunk_total++;
                 last_rx_tick = xTaskGetTickCount();
                 if (wifi_connected)
                     taskbar_invalidate();
@@ -540,6 +627,22 @@ bool netcard_socket_open(uint8_t id, bool tls, const char *host, uint16_t port) 
 
     uint32_t timeout = tls ? NC_TIMEOUT_TLS : NC_TIMEOUT_LONG;
 
+    /* Clear any stale socket with this id first (e.g. the C6 kept one
+     * open across an OS reboot/crashed transfer — it is not power-cycled
+     * by a BOOTSEL reflash).  Idempotent; ignore the result. */
+    {
+        char cls[32];
+        snprintf(cls, sizeof(cls), "AT+SCLOSE=%u", (unsigned)id);
+        nc_send_and_wait(cls, NC_TIMEOUT_DEFAULT);
+    }
+
+    /* Fresh byte accounting for this connection. */
+    serial_rx_total_bytes = 0;
+    nc_payload_total = nc_chunk_total = nc_desync_events = 0;
+    nc_in_desync = false;
+    nc_stats_printed = false;
+    serial_rx_stats_reset();
+
     for (int attempt = 0; attempt < 3; attempt++) {
         if (nc_send_and_wait(cmd, timeout))
             return true;
@@ -578,6 +681,8 @@ bool netcard_socket_send(uint8_t id, const uint8_t *data, uint16_t len) {
 void netcard_socket_close(uint8_t id) {
     if (id >= NC_MAX_SOCKETS)
         return;
+
+    nc_print_stats();
 
     char cmd[32];
     snprintf(cmd, sizeof(cmd), "AT+SCLOSE=%u", (unsigned)id);
@@ -665,6 +770,39 @@ void netcard_request_setpins(uint8_t rx_pin, uint8_t tx_pin, nc_cmd_done_cb_t do
 /* Netcard FreeRTOS task                                                      */
 /* -------------------------------------------------------------------------- */
 
+#define NETCARD_FAST_BAUD 921600u
+
+/* After a successful AT handshake, negotiate up to the fast baud.
+ * The C6 firmware replies OK at the old rate, flushes, waits 50 ms,
+ * then switches.  On any verification failure we fall back to 115200
+ * (older C6 firmware without AT+BAUD keeps working untouched). */
+static void nc_negotiate_baud(void) {
+    if (serial_get_baud() == NETCARD_FAST_BAUD)
+        return;
+    if (!nc_send_and_wait("AT+BAUD=921600", NC_TIMEOUT_DEFAULT)) {
+        printf("[NC] AT+BAUD not supported, staying at %u\n",
+               (unsigned)serial_get_baud());
+        return;
+    }
+    vTaskDelay(pdMS_TO_TICKS(120));   /* C6 switches 50 ms after OK */
+    serial_set_baud(NETCARD_FAST_BAUD);
+    /* Quietly drain line-transition garbage so it can't pollute the
+     * verify handshake (or the console). */
+    {
+        unsigned junk = 0;
+        vTaskDelay(pdMS_TO_TICKS(50));
+        while (serial_readable()) { serial_read_byte(); junk++; }
+        if (junk)
+            printf("[NC] drained %u transition bytes\n", junk);
+    }
+    if (nc_send_and_wait("AT", 1000) || nc_send_and_wait("AT", 1000)) {
+        printf("[NC] link at %u baud\n", (unsigned)NETCARD_FAST_BAUD);
+        return;
+    }
+    printf("[NC] fast baud verify failed — falling back to 115200\n");
+    serial_set_baud(115200);
+}
+
 static bool netcard_probe_ex(int attempts, uint32_t timeout, uint32_t drain_ms) {
     /* Drain stale data */
     printf("[NC] Probe: draining RX for %u ms\n", (unsigned)drain_ms);
@@ -672,9 +810,7 @@ static bool netcard_probe_ex(int attempts, uint32_t timeout, uint32_t drain_ms) 
     unsigned drained = 0;
     while (xTaskGetTickCount() < settle) {
         while (serial_readable()) {
-            uint8_t c = serial_read_byte();
-            printf("[NC RAW] 0x%02x '%c'\n", c,
-                   (c >= 0x20 && c < 0x7f) ? (char)c : '.');
+            serial_read_byte();
             drained++;
         }
         vTaskDelay(1);
@@ -683,11 +819,35 @@ static bool netcard_probe_ex(int attempts, uint32_t timeout, uint32_t drain_ms) 
 
     for (int attempt = 0; attempt < attempts; attempt++) {
         printf("[NC] Probe attempt %d/%d\n", attempt + 1, attempts);
-        if (nc_send_and_wait("AT", timeout))
+        if (nc_send_and_wait("AT", timeout)) {
+            nc_negotiate_baud();
             return true;
+        }
 
         vTaskDelay(pdMS_TO_TICKS(200));
         netcard_poll();
+    }
+
+    /* No answer at the current baud — the two sides can desync in both
+     * directions: RP2350 rebooted (boots at 115200) while the C6 stayed
+     * fast, or the C6 rebooted (boots at 115200) while we stayed fast.
+     * Retry at the other rate; if we land at 115200, negotiate back up. */
+    {
+        uint32_t prev  = serial_get_baud();
+        uint32_t other = (prev == NETCARD_FAST_BAUD) ? 115200u
+                                                     : NETCARD_FAST_BAUD;
+        printf("[NC] Probe: retrying at %u baud\n", (unsigned)other);
+        serial_set_baud(other);
+        vTaskDelay(pdMS_TO_TICKS(20));
+        for (int attempt = 0; attempt < 2; attempt++) {
+            if (nc_send_and_wait("AT", timeout)) {
+                nc_negotiate_baud();
+                return true;
+            }
+            vTaskDelay(pdMS_TO_TICKS(100));
+            netcard_poll();
+        }
+        serial_set_baud(prev);
     }
     return false;
 }
@@ -853,5 +1013,10 @@ void netcard_init_async(void) {
 
     cmd_queue = xQueueCreate(CMD_QUEUE_LEN, sizeof(net_cmd_t));
 
-    xTaskCreate(netcard_task, "netcard", 512, NULL, 1, NULL);
+    /* Priority 2 (== compositor): the netcard task is the serial RX
+     * consumer, and at 921600 it must keep draining while the
+     * compositor repaints transfer-progress UI — at priority 1 it fell
+     * ~20KB/s behind under repaint load and overflowed the RX ring.
+     * Round-robin with the compositor gives both plenty. */
+    xTaskCreate(netcard_task, "netcard", 512, NULL, 2, NULL);
 }
