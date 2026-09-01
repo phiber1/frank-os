@@ -24,6 +24,7 @@
 #include "task.h"
 #include "board_config.h"
 #include "display.h"
+#include "hardfault.h"
 #include "window.h"
 #include "window_event.h"
 #include "ps2.h"
@@ -271,6 +272,126 @@ void __attribute__((used, naked)) isr_hardfault(void) {
         "mov r1, lr          \n"
         "b hardfault_c_handler \n"
     );
+}
+
+/* ── DWT hardware-watchpoint diagnostics ────────────────────────────────
+ * os_watch_set(addr) arms DWT comparators 0/1 on the 8 bytes at addr for
+ * WRITE access; every write raises the DebugMonitor exception, which
+ * records the writer's PC/LR.  os_watch_get(idx,...) reads the hit ring.
+ * Used to catch memory stompers in the act (e.g. the MMBASIC vartbl
+ * corruption).  The write-match MATCH encoding is self-calibrated on a
+ * scratch variable at arm time, so no reliance on remembering the
+ * ARMv8-M encoding table.  DebugMon priority is 0x20: below DispHSTX's
+ * priority-0 scanline IRQ, above the FreeRTOS syscall mask. */
+#define WATCH_MAX_HITS 16
+static volatile struct { uint32_t pc, lr; } watch_hits[WATCH_MAX_HITS];
+static volatile uint32_t watch_hit_count;
+
+#define DWT_COMP0     (*(volatile uint32_t *)0xE0001020u)
+#define DWT_FUNC0     (*(volatile uint32_t *)0xE0001028u)
+#define DWT_COMP1     (*(volatile uint32_t *)0xE0001030u)
+#define DWT_FUNC1     (*(volatile uint32_t *)0xE0001038u)
+#define SCB_DEMCR     (*(volatile uint32_t *)0xE000EDFCu)
+#define SCB_DFSR      (*(volatile uint32_t *)0xE000ED30u)
+#define SCB_SHPR3_B0  (*(volatile uint8_t  *)0xE000ED20u)
+#define FN_MATCHED    (1u << 24)
+
+void __attribute__((used, naked)) isr_debugmon(void) {
+    __asm volatile(
+        "tst lr, #4          \n"
+        "ite eq              \n"
+        "mrseq r0, msp       \n"
+        "mrsne r0, psp       \n"
+        "mov r1, lr          \n"
+        "b debugmon_c_handler \n"
+    );
+}
+
+void __attribute__((used)) debugmon_c_handler(uint32_t *stack, uint32_t lr_val) {
+    (void)lr_val;
+    uint32_t n = watch_hit_count;
+    if (n < WATCH_MAX_HITS) {
+        watch_hits[n].pc = stack[6];
+        watch_hits[n].lr = stack[5];
+    }
+    watch_hit_count = n + 1;
+    SCB_DFSR = (1u << 2);          /* clear DFSR.DWTTRAP */
+    (void)DWT_FUNC0;               /* reading FUNCTION clears MATCHED */
+    (void)DWT_FUNC1;
+}
+
+#define DWT_CTRL      (*(volatile uint32_t *)0xE0001000u)
+#define DWT_LAR       (*(volatile uint32_t *)0xE0001FB0u)
+#define DWT_LSR       (*(volatile uint32_t *)0xE0001FB4u)
+
+/* Try one MATCH encoding on a scratch word with the DebugMonitor LIVE:
+ * a genuine write-match raises the exception and bumps the hit count.
+ * Returns true if a write matches and a read does not. */
+static bool watch_try_encoding(uint32_t fn_bits) {
+    static volatile uint32_t scratch;
+    DWT_COMP0 = (uint32_t)&scratch;
+    DWT_FUNC0 = fn_bits;
+    if ((DWT_FUNC0 & 0x3Fu) != (fn_bits & 0x3Fu))
+        return false;              /* register write didn't stick */
+    watch_hit_count = 0;
+    __asm volatile("dsb 0xF\n isb 0xF" ::: "memory");
+    scratch = 0x12345678u;
+    __asm volatile("dsb 0xF\n isb 0xF" ::: "memory");
+    bool w = watch_hit_count != 0;
+    watch_hit_count = 0;
+    (void)scratch;
+    __asm volatile("dsb 0xF\n isb 0xF" ::: "memory");
+    bool r = watch_hit_count != 0;
+    DWT_FUNC0 = 0;
+    return w && !r;
+}
+
+void os_watch_set(const void *addr) {
+    SCB_DEMCR |= (1u << 24);       /* TRCENA — enable DWT */
+    /* Cortex-M33 DWT sits behind a CoreSight software lock: register
+     * writes from software are silently ignored until unlocked (a
+     * debugger bypasses this, which is why openocd can set watchpoints
+     * without it). */
+    DWT_LAR = 0xC5ACCE55u;
+    __asm volatile("dsb 0xF" ::: "memory");
+
+    /* DebugMon must be live for calibration — hits are counted through
+     * the real exception path, validating the whole chain. */
+    SCB_SHPR3_B0 = 0x20;           /* DebugMon priority */
+    SCB_DEMCR |= (1u << 16);       /* MON_EN */
+
+    static const uint32_t candidates[] = { 0x5, 0x6, 0x4 };
+    uint32_t fn = 0;
+    for (unsigned i = 0; i < sizeof(candidates)/sizeof(candidates[0]); i++) {
+        uint32_t f = candidates[i] | (0x1u << 4) | (0x2u << 10);
+        if (watch_try_encoding(f)) { fn = f; break; }
+    }
+    if (!fn) {
+        printf("[WP] calibration failed: DWT_CTRL=%08X LSR=%08X "
+               "(NUMCOMP=%u) — watchpoint OFF\n",
+               (unsigned)DWT_CTRL, (unsigned)DWT_LSR,
+               (unsigned)(DWT_CTRL >> 28));
+        SCB_DEMCR &= ~(1u << 16);
+        return;
+    }
+
+    watch_hit_count = 0;
+    DWT_COMP0 = (uint32_t)addr;
+    DWT_COMP1 = (uint32_t)addr + 4;
+    DWT_FUNC0 = fn;
+    DWT_FUNC1 = fn;
+    (void)DWT_FUNC0;
+    (void)DWT_FUNC1;
+    printf("[WP] armed on %p (MATCH=%u)\n", addr, (unsigned)(fn & 0xF));
+}
+
+uint32_t os_watch_get(uint32_t idx, uint32_t *pc, uint32_t *lr) {
+    uint32_t n = watch_hit_count;
+    if (idx < n && idx < WATCH_MAX_HITS) {
+        if (pc) *pc = watch_hits[idx].pc;
+        if (lr) *lr = watch_hits[idx].lr;
+    }
+    return n;
 }
 
 /* Render a string at character grid (col, row) on the BSOD blue screen */
@@ -1108,7 +1229,9 @@ int main(void) {
         extern void isr_pendsv(void);
         extern void isr_systick(void);
         /* isr_hardfault is defined in this file (below) */
+        extern void isr_debugmon(void);
         ram_vector_table[3]  = (uint32_t)(uintptr_t)isr_hardfault;
+        ram_vector_table[12] = (uint32_t)(uintptr_t)isr_debugmon;
         ram_vector_table[11] = (uint32_t)(uintptr_t)isr_svcall;
         ram_vector_table[14] = (uint32_t)(uintptr_t)isr_pendsv;
         ram_vector_table[15] = (uint32_t)(uintptr_t)isr_systick;

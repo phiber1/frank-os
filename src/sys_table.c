@@ -748,5 +748,7 @@ unsigned long __in_systable() __aligned(4096) sys_table_ptrs[] = {
     wd_radio,                     // 554
     netcard_abort,                // 555
     wm_paint_was_frame_dirty,     // 556
+    os_watch_set,                 // 557 — arm DWT write-watchpoint (8 bytes)
+    os_watch_get,                 // 558 — read watchpoint hit ring
     0
 };
