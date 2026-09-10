@@ -750,5 +750,6 @@ unsigned long __in_systable() __aligned(4096) sys_table_ptrs[] = {
     wm_paint_was_frame_dirty,     // 556
     os_watch_set,                 // 557 — arm DWT write-watchpoint (8 bytes)
     os_watch_get,                 // 558 — read watchpoint hit ring
+    snd_synth,                    // 559 — OS-side synth voice bank (snd.h)
     0
 };
