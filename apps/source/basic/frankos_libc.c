@@ -583,17 +583,9 @@ void DisplayNotSet(void)           { }
 void SetBacklightSSD1963(int v)    { (void)v; }
 void Display_Refresh(void)         { }
 
-/* CFunction / External C function support */
-volatile int  CFuncInt1  = 0, CFuncInt2  = 0;
-volatile int  CFuncInt3  = 0, CFuncInt4  = 0;
-volatile int  CFuncmSec  = 0;
-void CallCFuncInt1(void) { }
-void CallCFuncInt2(void) { }
-void CallCFuncInt3(void) { }
-void CallCFuncInt4(void) { }
-void CallCFuncmSec(void) { }
-void CallCFunction(int n, ...) { (void)n; }
-void CallExecuteProgram(void *p) { (void)p; }
+/* CFunction / External C function support: the CFunc* interrupt vectors,
+ * CallCFunction and CallExecuteProgram all come from the real
+ * CFunction.c now — CSUB support is live. */
 void CNInterrupt(void) { }
 void CANInterrupt(void) { }
 

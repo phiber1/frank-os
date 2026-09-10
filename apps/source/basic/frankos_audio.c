@@ -84,6 +84,18 @@ static void *os_psram_alloc(size_t size) {
 static void os_psram_free(void *p) {
     typedef void (*fn)(void *); OST(492, fn)(p); }
 
+/* OS synth voice bank (syscall 559, src/snd.h) — PLAY SOUND voices are
+ * synthesized by the OS in the DMA IRQ from SRAM.  App-side synthesis
+ * executed from uncached PSRAM and one continuous voice cost ~10fps of
+ * game time in QMI instruction fetches. */
+enum { SNW_OFF = 0, SNW_SQUARE, SNW_TRIANGLE, SNW_SAW, SNW_SINE,
+       SNW_NOISE, SNW_GATED_NOISE, SNW_RINGMOD, SNW_SIREN, SNW_THUMP };
+static void os_snd_synth(int v, int sides, int wave, uint32_t f_mhz,
+                         uint32_t mod_hz, int amp) {
+    typedef void (*fn)(int, int, int, uint32_t, uint32_t, int);
+    OST(559, fn)(v, sides, wave, f_mhz, mod_hz, amp);
+}
+
 extern void vTaskDelay(uint32_t ticks);          /* frankos_libc.c, 1ms tick */
 
 /* helix MP3 decoder syscalls (443-448) */
@@ -177,6 +189,32 @@ const unsigned short nulltable[1]   = {97};
 const unsigned short squaretable[1] = {99};
 const unsigned short sawtable[1]    = {98};
 const unsigned short whitenoise[2]  = {0};    /* matched by pointer */
+static const unsigned short gatednoise[2] = {0}; /* noise chopped by a square
+                                                    gate at the given freq */
+static const unsigned short gatedtri[2] = {0};   /* "V": OS ring-mod voice */
+static const unsigned short sirentable[2] = {0}; /* "R": OS siren voice */
+static const unsigned short thumptable[2] = {0}; /* "D": OS drum-hit voice */
+/* "V" voice phase incs, same Q12 math as the list build:
+ * f*4096*4096*2/44100.  The carrier is a 700Hz square ring-modulated
+ * (XOR) by a second square whose frequency ramps 200Hz -> 2kHz over
+ * ~250ms of the strike — the sidebands spread as it climbs, so the
+ * ring grows steadily more metallic, peaking at the end of the sound.
+ * The PLAY SOUND frequency parameter of "V" is the GATE rate. */
+#define VCARRIER_INC   532610u
+#define VMOD_START_INC 152174u   /* 200Hz */
+#define VMOD_MAX_INC  3043486u   /* 4kHz — high starts still rise to crisp
+                                    (sidebands live at |700 ± mod|; a mod
+                                    START near the carrier beats at ~0Hz,
+                                    which is the "plunger thunk") */
+#define VMOD_RAMP         248u   /* per-sample inc growth (~250ms sweep) */
+/* per-voice mod override: the fractional part of the "V" frequency
+ * parameter * 10000 encodes the modulator.  Value < 5000: rising-ramp
+ * sweep starting at that many Hz (0 = classic 200Hz default).  Value
+ * >= 5000: back-and-forth mode — the mod freq swings +/-50% around
+ * (value-5000) Hz on a triangle LFO at half the gate rate (bit31 set
+ * in the stored inc marks this mode). */
+static uint32_t vmodstart[MAXSOUNDS * 2];
+#define VMOD_OSC 0x80000000u
 unsigned short *noisetable = NULL;            /* periodic noise, setnoise() */
 unsigned short *usertable  = NULL;            /* PLAY LOAD SOUND */
 
@@ -255,6 +293,11 @@ static int synth_tone_chunk(int16_t *buf, int nframes) {
 static void synth_sound_chunk(int16_t *buf, int nframes) {
     static int noisedwell[MAXSOUNDS * 2];
     static int noiseval[MAXSOUNDS * 2];
+    /* "V" ring-mod state; the was-active flags let a fresh strike
+     * restart the modulator ramp from its low, barely-rough start */
+    static uint32_t vmacc[MAXSOUNDS * 2], vminc[MAXSOUNDS * 2];
+    static uint32_t vlacc[MAXSOUNDS * 2];
+    static uint8_t vwas[MAXSOUNDS * 2];
 
     /* Build the active-voice list ONCE per chunk.  The naive form walked
      * all 4 channels x 2 sides every frame; the big branchy loop body
@@ -264,7 +307,7 @@ static void synth_sound_chunk(int16_t *buf, int nframes) {
         const unsigned short *t;   /* wavetable (or marker) */
         uint32_t acc, inc;         /* Q12 phase */
         int vol;                   /* mapping[] value */
-        uint8_t chan, right, white;
+        uint8_t chan, right, white, gated, vgated;
     } av[MAXSOUNDS * 2];
     int nact = 0;
     for (int i = 0; i < MAXSOUNDS; i++) {
@@ -272,19 +315,40 @@ static void synth_sound_chunk(int16_t *buf, int nframes) {
             struct av *a = &av[nact++];
             a->t = (const unsigned short *)sound_mode_left[i];
             a->acc = (uint32_t)(sound_PhaseAC_left[i] * 4096.0f) & 0xFFFFFF;
-            a->inc = (uint32_t)(sound_PhaseM_left[i] * 4096.0f);
+            a->inc = (uint32_t)(sound_PhaseM_left[i] * 4096.0f) << 1;  /* 22050Hz synth, phase math is 44100-based */
             a->vol = mapping[sound_v_left[i]];
             a->chan = i; a->right = 0;
             a->white = (a->t == whitenoise);
+            a->gated = (a->t == gatednoise);
+            a->vgated = (a->t == gatedtri);
         }
         if (sound_mode_right[i] != nulltable) {
             struct av *a = &av[nact++];
             a->t = (const unsigned short *)sound_mode_right[i];
             a->acc = (uint32_t)(sound_PhaseAC_right[i] * 4096.0f) & 0xFFFFFF;
-            a->inc = (uint32_t)(sound_PhaseM_right[i] * 4096.0f);
+            a->inc = (uint32_t)(sound_PhaseM_right[i] * 4096.0f) << 1;
             a->vol = mapping[sound_v_right[i]];
             a->chan = i; a->right = 1;
             a->white = (a->t == whitenoise);
+            a->gated = (a->t == gatednoise);
+            a->vgated = (a->t == gatedtri);
+        }
+    }
+
+    /* "V" strike detection: a voice that just (re)appeared restarts
+     * its modulator ramp (must run even when nact drops to 0 so the
+     * NEXT strike is seen as fresh) */
+    {
+        uint8_t vnow[MAXSOUNDS * 2] = {0};
+        for (int k = 0; k < nact; k++)
+            if (av[k].vgated) vnow[av[k].chan * 2 + av[k].right] = 1;
+        for (int i = 0; i < MAXSOUNDS * 2; i++) {
+            if (vnow[i] && !vwas[i]) {
+                vmacc[i] = 0;
+                vlacc[i] = 0;
+                vminc[i] = vmodstart[i] ? vmodstart[i] : VMOD_START_INC;
+            }
+            vwas[i] = vnow[i];
         }
     }
 
@@ -299,10 +363,85 @@ static void synth_sound_chunk(int16_t *buf, int nframes) {
         struct av *a = &av[k];
         int32_t *m = mix[a->right];
         int vol = a->vol;
-        if (a->white) {
+        if (a->gated) {
+            /* white noise multiplied by a square gate at the voice
+             * frequency — the SN76477-style "shredded static" (a summed
+             * low square + noise just sounds like a pong over a shsh) */
             int di = a->chan * 2 + a->right;
             int dwell = noisedwell[di], nv = noiseval[di];
-            int period = (int)(a->inc >> 12);
+            uint32_t acc = a->acc, inc = a->inc;
+            for (int n = 0; n < nframes; n++) {
+                if (--dwell <= 0) { dwell = 3; nv = rand() % 3800 + 100; }
+                int on = ((acc >> 12) <= 2047);
+                acc = (acc + inc) & 0xFFFFFF;
+                if (on) m[n] += (nv - 2000) * vol / 2000;
+            }
+            a->acc = acc;
+            noisedwell[di] = dwell; noiseval[di] = nv;
+        } else if (a->vgated) {
+            /* the "ring" of the invader-hit sound: 700Hz square,
+             * ring-modulated (XOR) by a square whose pitch climbs
+             * 200Hz -> 2kHz through the strike (increasingly metallic),
+             * the whole thing blocked/unblocked at the VOICE FREQUENCY
+             * (the gate rate is the tunable, so it lives in the freq
+             * param).  A strike resets the gate phase, so the sound
+             * opens gate-on. */
+            static uint32_t caracc[MAXSOUNDS * 2];
+            int di = a->chan * 2 + a->right;
+            uint32_t gacc = a->acc, ginc = a->inc;
+            uint32_t cacc = caracc[di];
+            uint32_t macc = vmacc[di], minc = vminc[di];
+            uint32_t lacc = vlacc[di];
+            if (minc & VMOD_OSC) {
+                /* back-and-forth mode: mod freq swings +/-50% around a
+                 * center on a triangle LFO at half the gate rate; the
+                 * center itself climbs gently so the whole sound still
+                 * rises to a crisp at the fade-out */
+                uint32_t ci = minc & ~VMOD_OSC;
+                uint32_t linc = ginc >> 1;
+                for (int n = 0; n < nframes; n++) {
+                    int cbit = ((cacc >> 12) > 2047);
+                    int mbit = ((macc >> 12) > 2047);
+                    int j = (cbit ^ mbit) ? 3900 : 100;
+                    cacc = (cacc + VCARRIER_INC) & 0xFFFFFF;
+                    int ph = (int)(lacc >> 11);            /* 0..8191 */
+                    int tri = ph < 4096 ? ph : 8191 - ph;  /* 0..4095 */
+                    uint32_t mi = (ci >> 1) + (uint32_t)(((uint64_t)ci * (uint32_t)tri) >> 12);
+                    macc = (macc + mi) & 0xFFFFFF;
+                    lacc = (lacc + linc) & 0xFFFFFF;
+                    if (ci < VMOD_MAX_INC) ci += VMOD_RAMP >> 1;
+                    int on = ((gacc >> 12) <= 2047);
+                    gacc = (gacc + ginc) & 0xFFFFFF;
+                    if (on) m[n] += (j - 2000) * vol / 2000;
+                }
+                minc = VMOD_OSC | ci;
+            } else {
+                for (int n = 0; n < nframes; n++) {
+                    int cbit = ((cacc >> 12) > 2047);
+                    int mbit = ((macc >> 12) > 2047);
+                    int j = (cbit ^ mbit) ? 3900 : 100;
+                    cacc = (cacc + VCARRIER_INC) & 0xFFFFFF;
+                    macc = (macc + minc) & 0xFFFFFF;
+                    if (minc < VMOD_MAX_INC) minc += VMOD_RAMP;
+                    int on = ((gacc >> 12) <= 2047);
+                    gacc = (gacc + ginc) & 0xFFFFFF;
+                    if (on) m[n] += (j - 2000) * vol / 2000;
+                }
+            }
+            a->acc = gacc;
+            caracc[di] = cacc;
+            vmacc[di] = macc; vminc[di] = minc; vlacc[di] = lacc;
+        } else if (a->white) {
+            int di = a->chan * 2 + a->right;
+            int dwell = noisedwell[di], nv = noiseval[di];
+            /* noise semantics: the PLAY SOUND frequency is the NOISE
+             * CHANGE RATE in Hz.  period = synth_rate / f, with
+             * inc = f * 2^25 / 44100 (doubled for the 22050 synth):
+             * period = 22050 * 761 / inc.  The old proportional form
+             * ran BACKWARDS (2500Hz "pish" became a ~190Hz crackle). */
+            unsigned pinc = a->inc ? (unsigned)a->inc : 1;
+            int period = (int)(16780000u / pinc);
+            if (period < 1) period = 1;
             for (int n = 0; n < nframes; n++) {
                 if (dwell <= 0) { dwell = period; nv = rand() % 3800 + 100; }
                 if (dwell) dwell--;
@@ -427,7 +566,8 @@ static void audio_pump_task(void *param) {
     int chan_open = 0, chan_rate = 0, linger = 0;
     for (;;) {
         e_CurrentlyPlaying st = CurrentlyPlaying;
-        int want_rate = (st == P_TONE || st == P_SOUND) ? 44100 :
+        /* P_SOUND is synthesized OS-side (snd_synth) — no pump involved */
+        int want_rate = (st == P_TONE) ? 44100 :
                         (st == P_WAV || st == P_MP3 || st == P_FLAC || st == P_MOD)
                             ? src_rate : 0;
         if (want_rate == 0) {
@@ -478,9 +618,6 @@ static void audio_pump_task(void *param) {
                 CurrentlyPlaying = P_NOTHING;
                 WAVcomplete = true;          /* fires BASIC interrupt if set */
             }
-        } else if (st == P_SOUND) {
-            synth_sound_chunk(pump_buf, PUMP_CHUNK);
-            os_pcm_write(pump_buf, PUMP_CHUNK);
         } else {                             /* file source */
             int n = decode_chunk();
             if (n > 0) {
@@ -525,6 +662,8 @@ static void free_file_source(void) {
 }
 
 void StopAudio(void) {
+    for (int i = 0; i < 8; i++)
+        os_snd_synth(i, 3, SNW_OFF, 0, 0, 0);   /* OS voices die with us */
     if (CurrentlyPlaying != P_NOTHING) CurrentlyPlaying = P_STOP;
     SoundPlay = 0;
     wait_pump_idle();
@@ -765,14 +904,15 @@ void cmd_play(void) {
     }
     if ((tp = checkstring(cmdline, (unsigned char *)"SOUND"))) {
         /* PLAY SOUND channel, position, type [, frequency [, volume]] */
-        float f_in, PhaseM;
+        float f_in;
         int channel, left = 0, right = 0;
-        int local_v_left = 0, local_v_right = 0;
+        uint32_t v_modhz = 0;
         char *p;
         const unsigned short *tbl = NULL;
         getcsargs(&tp, 9);
         if (!(argc == 9 || argc == 7 || argc == 5)) error("Syntax");
-        channel = getint(argv[0], 1, MAXSOUNDS) - 1;
+        channel = getint(argv[0], 1, 8) - 1;   /* OS synth has 8 voices
+                                                  (SND_SYNTH_VOICES) */
         /* position: bare letter first (PLAY SOUND 1,B,S,...), then
          * string expression fallback ("B" or a string variable) */
         if      (checkstring(argv[2], (unsigned char *)"L")) left = 1;
@@ -798,6 +938,10 @@ void cmd_play(void) {
         else if (checkstring(argv[4], (unsigned char *)"S")) tbl = SineTable;
         else if (checkstring(argv[4], (unsigned char *)"P")) { setnoise(); tbl = noisetable; }
         else if (checkstring(argv[4], (unsigned char *)"N")) tbl = whitenoise;
+        else if (checkstring(argv[4], (unsigned char *)"G")) tbl = gatednoise;
+        else if (checkstring(argv[4], (unsigned char *)"V")) tbl = gatedtri;
+        else if (checkstring(argv[4], (unsigned char *)"R")) tbl = sirentable;
+        else if (checkstring(argv[4], (unsigned char *)"D")) tbl = thumptable;
         else if (checkstring(argv[4], (unsigned char *)"U")) {
             if (usertable == NULL) error("Not loaded");
             tbl = usertable;
@@ -811,6 +955,10 @@ void cmd_play(void) {
             else if (strcasecmp(p, "S") == 0) tbl = SineTable;
             else if (strcasecmp(p, "P") == 0) { setnoise(); tbl = noisetable; }
             else if (strcasecmp(p, "N") == 0) tbl = whitenoise;
+            else if (strcasecmp(p, "G") == 0) tbl = gatednoise;
+            else if (strcasecmp(p, "V") == 0) tbl = gatedtri;
+            else if (strcasecmp(p, "R") == 0) tbl = sirentable;
+            else if (strcasecmp(p, "D") == 0) tbl = thumptable;
             else if (strcasecmp(p, "U") == 0) {
                 if (usertable == NULL) error("Not loaded");
                 tbl = usertable;
@@ -820,29 +968,33 @@ void cmd_play(void) {
         f_in = 10.0f;
         if (argc >= 7) f_in = getnumber(argv[6]);
         if (f_in < 1.0 || f_in > 20000.0) error("Valid is 1Hz to 20KHz");
+        if (tbl == gatedtri || tbl == sirentable) {
+            /* "V"/"R": integer part = gate rate / base freq; fraction
+             * * 10000 = the modulator code, decoded OS-side (snd.h) */
+            int gate = (int)f_in;
+            v_modhz = (uint32_t)((f_in - (float)gate) * 10000.0f + 0.5f);
+            f_in = (float)gate;
+        }
         int vparm = 25;
         if (argc == 9) vparm = getint(argv[8], 0, 100 / MAXSOUNDS);
         int vmapped = vparm * 41 / (100 / MAXSOUNDS);
-        ensure_pump();
-        if (left) {
-            PhaseM = (tbl == whitenoise) ? f_in
-                                         : f_in / (float)PWM_FREQ * 4096.0f;
-            if (sound_mode_left[channel] != tbl) sound_PhaseAC_left[channel] = 0.0f;
-            sound_PhaseM_left[channel] = PhaseM;
-            sound_v_left[channel] = vmapped;
-            local_v_left = vmapped;
-            sound_mode_left[channel] = (unsigned short *)tbl;
-        }
-        if (right) {
-            PhaseM = (tbl == whitenoise) ? f_in
-                                         : f_in / (float)PWM_FREQ * 4096.0f;
-            if (sound_mode_right[channel] != tbl) sound_PhaseAC_right[channel] = 0.0f;
-            sound_PhaseM_right[channel] = PhaseM;
-            sound_v_right[channel] = vmapped;
-            local_v_right = vmapped;
-            sound_mode_right[channel] = (unsigned short *)tbl;
-        }
-        (void)local_v_left; (void)local_v_right;
+        int wave;
+        if      (tbl == nulltable)     wave = SNW_OFF;
+        else if (tbl == squaretable)   wave = SNW_SQUARE;
+        else if (tbl == triangletable) wave = SNW_TRIANGLE;
+        else if (tbl == sawtable)      wave = SNW_SAW;
+        else if (tbl == SineTable)     wave = SNW_SINE;
+        else if (tbl == whitenoise)    wave = SNW_NOISE;
+        else if (tbl == noisetable)    wave = SNW_NOISE;   /* "P": OS synth
+                                          has no periodic-noise table */
+        else if (tbl == gatednoise)    wave = SNW_GATED_NOISE;
+        else if (tbl == gatedtri)      wave = SNW_RINGMOD;
+        else if (tbl == sirentable)    wave = SNW_SIREN;
+        else if (tbl == thumptable)    wave = SNW_THUMP;
+        else error("Type not supported");   /* usertable ("U") */
+        os_snd_synth(channel, (left ? 1 : 0) | (right ? 2 : 0), wave,
+                     (uint32_t)(f_in * 1000.0f + 0.5f), v_modhz,
+                     mapping[vmapped]);
         CurrentlyPlaying = P_SOUND;
         return;
     }

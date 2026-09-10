@@ -334,6 +334,9 @@ uint8_t PSRAMpin;
         f.a = c;
         return f.b;
     }
+#ifdef _FRANKOS
+    extern void basic_gfx_mark(int x1, int y1, int x2, int y2);
+#endif
     const void *const CallTable[] __attribute__((section(".text"))) = {
         (void *)uSecFunc,           // 0x00
         (void *)putConsole,         // 0x04
@@ -390,6 +393,16 @@ uint8_t PSRAMpin;
         (void *)&CFuncInt3,         // 0xb8
         (void *)&CFuncInt4,         // 0xbc
         (void *)PIOExecute,
+#ifdef _FRANKOS
+        /* FRANKOS extensions for CSUBs (indices 55, 56):
+         * [55] basic_gfx_mark(x1,y1,x2,y2) — mark a pixel rect dirty so
+         *      the display flush repaints it (CSUBs drawing directly
+         *      into the buffer MUST call this once per frame)
+         * [56] &WriteBuf — address of the draw-buffer pointer (4bpp,
+         *      high nibble = left pixel, stride = HRes/2 bytes) */
+        (void *)basic_gfx_mark,
+        (void *)&WriteBuf,
+#endif
     };
 #ifdef rp2350
     // this is a frig to place the calltable at 0x1000023C as in previous releases

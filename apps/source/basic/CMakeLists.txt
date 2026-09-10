@@ -33,6 +33,7 @@ set(COMPILED_DIR "${CMAKE_SOURCE_DIR}/../../../sdcard/fos")
 # Their cmd_*/fun_* entry points are stubbed in frankos_stubs.c.
 set(MMBASIC_SOURCES
     PicoMite.c
+    CFunction.c
     MMBasic.c
     Operators.c
     Functions.c
