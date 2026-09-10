@@ -14,6 +14,7 @@
 #include <stdbool.h>
 #include "window.h"
 #include "keyboard.h"
+#include "controls.h"
 #include "FreeRTOS.h"
 #include "task.h"
 #include "semphr.h"
@@ -38,6 +39,25 @@
  */
 #define TERM_TEXTBUF_SIZE   (TERM_COLS * TERM_ROWS * 2)  /* default size */
 
+/* Scrollback history — lines that have scrolled off the top are kept so the
+ * user can scroll back through console output.  This is a console-host
+ * feature: every client process (pshell, MOS2 apps, ELF tools) that writes to
+ * the terminal inherits it for free.
+ *
+ * Storage is variable-length: each line is trimmed of trailing blanks and its
+ * used cells stored in a per-line SRAM buffer, because the FreeRTOS heap is
+ * only ~120 KB and a fixed 500 x cols x 2 grid (68 KB) would starve it.  A
+ * hard byte budget caps total memory regardless of content. */
+#define SCROLLBACK_LINES        500          /* max lines of history */
+#define SCROLLBACK_BUDGET_BYTES (24 * 1024)  /* hard cap on history RAM */
+
+/* One stored scrollback line: `len` trimmed cells at `cells` (char,attr
+ * pairs).  cells == NULL means an empty line (len 0) or a failed allocation. */
+typedef struct {
+    uint8_t *cells;   /* len*2 bytes (SRAM), or NULL */
+    uint16_t len;     /* cells stored (0..cols) */
+} sb_line_t;
+
 /* Maximum stdin waiters per terminal (MOS2 apps) */
 #define MAX_STDIN_WAITERS 4
 
@@ -56,6 +76,16 @@ struct terminal {
 
     /* Current grid dimensions (dynamic — changes on resize) */
     int      cols, rows;
+
+    /* Scrollback ring (console history) — variable-length per-line storage.
+     * Lines that scroll off the top of textbuf are pushed here trimmed. */
+    sb_line_t *sb_slot;      /* ring of sb_lines entries (NULL if disabled) */
+    int      sb_lines;       /* ring capacity (SCROLLBACK_LINES) */
+    int      sb_count;       /* lines currently stored (0..sb_lines) */
+    int      sb_head;        /* ring index of next write slot */
+    int32_t  sb_bytes;       /* total cell bytes currently held (vs budget) */
+    int      view_offset;    /* lines scrolled back from live view (0 = bottom) */
+    scrollbar_t vsb;         /* vertical scrollbar control */
 
     int      cursor_col, cursor_row;
     uint8_t  fg_color, bg_color;

@@ -53,6 +53,99 @@
  * Helpers
  *=========================================================================*/
 
+/* Free the oldest scrollback line, reclaiming its bytes. */
+static void sb_free_oldest(terminal_t *t) {
+    if (t->sb_count == 0) return;
+    int tail = (t->sb_head - t->sb_count + t->sb_lines) % t->sb_lines;
+    sb_line_t *e = &t->sb_slot[tail];
+    if (e->cells) { vPortFree(e->cells); e->cells = NULL; }
+    t->sb_bytes -= (int32_t)e->len * 2;
+    e->len = 0;
+    t->sb_count--;
+}
+
+/* Drop all scrollback history (used on resize/destroy). */
+static void sb_clear(terminal_t *t) {
+    while (t->sb_count > 0) sb_free_oldest(t);
+    t->sb_head = 0;
+    t->sb_bytes = 0;
+    t->view_offset = 0;
+}
+
+/* Push textbuf row 0 (about to be discarded by a scroll) into scrollback.
+ * Trims trailing blanks and stores the used cells in a right-sized SRAM
+ * buffer; evicts oldest lines to stay within the line-count and byte budgets.
+ * Kept out of SRAM (no __not_in_flash_func) since it touches only SRAM/heap —
+ * there's no PSRAM here, so no QMI flash-fetch contention to avoid. */
+static __attribute__((noinline)) void sb_push_row0(terminal_t *t, int cols) {
+    volatile uint8_t *r0 = t->textbuf;                 /* row 0 cells */
+    int len = cols;
+    while (len > 0 && r0[(len - 1) * 2] == ' ') len--; /* trim trailing */
+    int need = len * 2;
+
+    /* Make room: never exceed sb_lines entries or the byte budget. */
+    while (t->sb_count > 0 &&
+           (t->sb_count >= t->sb_lines ||
+            t->sb_bytes + need > SCROLLBACK_BUDGET_BYTES))
+        sb_free_oldest(t);
+
+    sb_line_t *e = &t->sb_slot[t->sb_head];
+    e->cells = NULL;
+    e->len = 0;
+    if (need > 0) {
+        uint8_t *buf = (uint8_t *)pvPortMalloc(need);
+        if (buf) {
+            for (int i = 0; i < need; i++) buf[i] = r0[i];
+            e->cells = buf;
+            e->len = (uint16_t)len;
+            t->sb_bytes += need;
+        }
+        /* If malloc fails the slot stays empty — history degrades gracefully
+         * (a blank line) rather than crashing. */
+    }
+    t->sb_head = (t->sb_head + 1) % t->sb_lines;
+    t->sb_count++;
+
+    /* If the user is scrolled back into history, keep the same content
+     * anchored on screen as new lines push in (clamp at top of ring). */
+    if (t->view_offset > 0) {
+        t->view_offset++;
+        if (t->view_offset > t->sb_count) t->view_offset = t->sb_count;
+    }
+}
+
+/* Reconstruct the visible rows into `shadow` when scrolled back into history.
+ * Each display row maps to a scrollback line (trimmed cells, padded to width)
+ * or a live textbuf row.  Flash helper — touches only SRAM/heap. */
+static __attribute__((noinline)) void sb_build_shadow(terminal_t *t,
+                            uint8_t *shadow, int term_cols, int term_rows) {
+    int rowbytes = term_cols * 2;
+    uint8_t blank_attr = TB_PACK(t->fg_color, t->bg_color);
+    for (int r = 0; r < term_rows; r++) {
+        int combined = t->sb_count - t->view_offset + r;
+        uint8_t *dst = shadow + r * rowbytes;
+        if (combined < t->sb_count) {
+            /* Scrollback line: chronological index `combined` (0 = oldest).
+             * Copy the trimmed cells, then pad the row with blanks. */
+            int ring = (t->sb_head - t->sb_count + combined + t->sb_lines)
+                       % t->sb_lines;
+            sb_line_t *e = &t->sb_slot[ring];
+            int n = e->cells ? e->len : 0;
+            if (n > term_cols) n = term_cols;
+            for (int i = 0; i < n * 2; i++) dst[i] = e->cells[i];
+            for (int c = n; c < term_cols; c++) {
+                dst[c * 2]     = ' ';
+                dst[c * 2 + 1] = blank_attr;
+            }
+        } else {
+            /* Live textbuf row */
+            volatile uint8_t *src =
+                t->textbuf + (combined - t->sb_count) * rowbytes;
+            for (int i = 0; i < rowbytes; i++) dst[i] = src[i];
+        }
+    }
+}
+
 static void __not_in_flash_func(terminal_scroll_up)(terminal_t *t) {
     /* Move rows 1..rows-1 up to rows 0..rows-2.
      * Manual loop instead of memmove() because memmove is in flash and
@@ -60,6 +153,12 @@ static void __not_in_flash_func(terminal_scroll_up)(terminal_t *t) {
      * CS1 (PSRAM data) QMI bus contention that hangs the system. */
     int cols = t->cols;
     int rows = t->rows;
+
+    /* Push the top row (about to be discarded) into scrollback (flash helper —
+     * no PSRAM involved, so it need not live in SRAM). */
+    if (t->sb_slot)
+        sb_push_row0(t, cols);
+
     volatile uint8_t *dst = t->textbuf;
     volatile uint8_t *src = t->textbuf + cols * 2;
     int n = cols * 2 * (rows - 1);
@@ -79,6 +178,27 @@ static void terminal_input_push(terminal_t *t, uint8_t ch) {
     t->input_buf[t->in_head] = ch;
     t->in_head = next;
     xSemaphoreGive(t->input_sem);
+}
+
+/* Scrollback view control.  view_offset counts lines back from the live
+ * bottom (0 = showing live output).  Positive delta scrolls into history. */
+static void terminal_scroll_view(terminal_t *t, int delta_lines) {
+    int nv = t->view_offset + delta_lines;
+    if (nv < 0) nv = 0;
+    if (nv > t->sb_count) nv = t->sb_count;
+    if (nv != t->view_offset) {
+        t->view_offset = nv;
+        wm_invalidate(t->hwnd);
+    }
+}
+
+/* Snap the view back to live output (bottom).  Called on user input so
+ * typing always jumps to where new characters appear. */
+static void terminal_snap_bottom(terminal_t *t) {
+    if (t->view_offset != 0) {
+        t->view_offset = 0;
+        wm_invalidate(t->hwnd);
+    }
 }
 
 /*==========================================================================
@@ -133,17 +253,23 @@ static void __not_in_flash_func(terminal_paint)(hwnd_t hwnd) {
     int term_rows = t->rows;
     int bufsize = term_cols * term_rows * 2;
 
-    /* Snapshot textbuf into SRAM — one bulk copy instead of thousands
-     * of individual PSRAM reads during the rendering loop.
-     * Manual loop instead of memcpy() because memcpy is in flash and
-     * calling it on a PSRAM source causes QMI bus contention (CS0
-     * instruction fetch + CS1 data read simultaneously → bus hang).
-     * volatile source prevents the compiler from converting this back
-     * into a memcpy call. */
-    {
+    /* Snapshot the visible content into SRAM — one bulk copy instead of
+     * thousands of individual reads during the rendering loop.  Manual loop
+     * instead of memcpy() because memcpy is in flash and calling it on a
+     * PSRAM source causes QMI bus contention (CS0 instruction fetch + CS1
+     * data read simultaneously → bus hang).  volatile source prevents the
+     * compiler from converting this back into a memcpy call.
+     *
+     * The visible window is a slice of the virtual buffer
+     *   [ sb_count scrollback lines ] ++ [ term_rows live textbuf lines ]
+     * starting at virtual index (sb_count - view_offset).  When view_offset
+     * is 0 every display row maps to a live textbuf row (fast common case). */
+    if (t->view_offset == 0 || !t->sb_slot) {
         volatile uint8_t *src = t->textbuf;
         for (int i = 0; i < bufsize; i++)
             paint_shadow[i] = src[i];
+    } else {
+        sb_build_shadow(t, paint_shadow, term_cols, term_rows);
     }
 
     /* Compute client-area origin in screen coordinates directly,
@@ -199,8 +325,10 @@ static void __not_in_flash_func(terminal_paint)(hwnd_t hwnd) {
         }
     }
 
-    /* Draw blinking DOS-style underline cursor (bottom 2 scanlines) */
-    if (t->cursor_visible &&
+    /* Draw blinking DOS-style underline cursor (bottom 2 scanlines).
+     * Hidden while scrolled back into history — the cursor belongs to the
+     * live output, which isn't on screen there. */
+    if (t->cursor_visible && t->view_offset == 0 &&
         t->cursor_col >= 0 && t->cursor_col < term_cols &&
         t->cursor_row >= 0 && t->cursor_row < term_rows) {
         int cx = ox + t->cursor_col * TERM_FONT_W;
@@ -208,6 +336,21 @@ static void __not_in_flash_func(terminal_paint)(hwnd_t hwnd) {
         display_hline_safe(cx, cy + TERM_FONT_H - 2, TERM_FONT_W, t->fg_color);
         display_hline_safe(cx, cy + TERM_FONT_H - 1, TERM_FONT_W, t->fg_color);
     }
+
+    /* Vertical scrollbar down the right edge of the text area.  Uses the
+     * wd_* client-drawing API, which is valid here because the compositor
+     * wraps every paint handler in wd_begin(hwnd)/wd_end() with the client
+     * origin already set — the same origin the grid above was drawn at. */
+    t->vsb.x = term_cols * TERM_FONT_W;      /* just past the last text column */
+    t->vsb.y = 0;
+    t->vsb.w = SCROLLBAR_WIDTH;
+    t->vsb.h = term_rows * TERM_FONT_H;
+    scrollbar_set_range(&t->vsb, t->sb_count + term_rows, term_rows);
+    scrollbar_set_pos(&t->vsb, t->sb_count - t->view_offset);
+    /* The strip is permanently reserved, so always draw the track (it shows
+     * a full-height thumb / no thumb when there's nothing to scroll). */
+    t->vsb.visible = true;
+    scrollbar_paint(&t->vsb);
 }
 
 /*==========================================================================
@@ -249,6 +392,7 @@ static bool terminal_event(hwnd_t hwnd, const window_event_t *event) {
 
     switch (event->type) {
     case WM_CHAR:
+        terminal_snap_bottom(t);   /* typing jumps to live output */
         terminal_input_push(t, (uint8_t)event->charev.ch);
         return true;
 
@@ -256,7 +400,34 @@ static bool terminal_event(hwnd_t hwnd, const window_event_t *event) {
         terminal_resize(t, event->size.w, event->size.h);
         return true;
 
+    case WM_MOUSEMOVE:
+    case WM_LBUTTONDOWN:
+    case WM_LBUTTONUP: {
+        /* Route to the scrollbar (client-relative coords).  new_pos is the
+         * top virtual line; convert back to a view_offset from the bottom. */
+        int32_t new_pos;
+        if (scrollbar_event(&t->vsb, event, &new_pos)) {
+            int off = t->sb_count - (int)new_pos;
+            if (off < 0) off = 0;
+            if (off > t->sb_count) off = t->sb_count;
+            if (off != t->view_offset) {
+                t->view_offset = off;
+                wm_invalidate(hwnd);
+            }
+            return true;
+        }
+        return false;
+    }
+
     case WM_KEYDOWN:
+        /* Scrollback view controls (HID usage codes).  These are consumed by
+         * the host and never reach the client. */
+        switch (event->key.scancode) {
+        case 0x4B: terminal_scroll_view(t, t->rows - 1);  return true; /* PgUp */
+        case 0x4E: terminal_scroll_view(t, -(t->rows - 1)); return true; /* PgDn */
+        case 0x4A: terminal_scroll_view(t, t->sb_count);  return true; /* Home: top */
+        case 0x4D: terminal_scroll_view(t, -t->sb_count); return true; /* End: bottom */
+        }
         /* Alt+Enter: toggle fullscreen (before Enter→'\n' mapping) */
         if (event->key.scancode == 0x28 && (event->key.modifiers & KMOD_ALT)) {
             wm_toggle_fullscreen(hwnd);
@@ -268,10 +439,10 @@ static bool terminal_event(hwnd_t hwnd, const window_event_t *event) {
             wm_post_event(hwnd, &ce); return true;
         }
         switch (event->key.scancode) {
-        case 0x28: terminal_input_push(t, '\n');  return true;
-        case 0x29: terminal_input_push(t, 0x1B);  return true;
-        case 0x2A: terminal_input_push(t, '\b');  return true;
-        case 0x2B: terminal_input_push(t, '\t');  return true;
+        case 0x28: terminal_snap_bottom(t); terminal_input_push(t, '\n');  return true;
+        case 0x29: terminal_snap_bottom(t); terminal_input_push(t, 0x1B);  return true;
+        case 0x2A: terminal_snap_bottom(t); terminal_input_push(t, '\b');  return true;
+        case 0x2B: terminal_snap_bottom(t); terminal_input_push(t, '\t');  return true;
         }
         return false;
 
@@ -393,6 +564,18 @@ hwnd_t terminal_create(void) {
         t->textbuf[i * 2 + 1] = attr;
     }
 
+    /* Allocate the scrollback slot ring (small — ~4 KB; line cell buffers are
+     * malloc'd on demand as lines scroll off).  Terminal still works if this
+     * fails; scrollback is just disabled. */
+    t->sb_lines = SCROLLBACK_LINES;
+    t->sb_count = 0;
+    t->sb_head = 0;
+    t->sb_bytes = 0;
+    t->view_offset = 0;
+    t->sb_slot = (sb_line_t *)pvPortCalloc(t->sb_lines, sizeof(sb_line_t));
+    scrollbar_init(&t->vsb, false);
+    t->vsb.step = 1;   /* scrollbar range is in lines — arrows step 1 line */
+
     /* Create input semaphore */
     t->input_sem = xSemaphoreCreateCounting(64, 0);
 
@@ -400,9 +583,10 @@ hwnd_t terminal_create(void) {
     extern void terminal_setup_menu(terminal_t *t);
 
     /* Compute outer window size:
-     * client = 560 x 320 (70 cols * 8px, 20 rows * 16px)
+     * client = 560 text + 16 scrollbar = 576 wide, 320 tall
+     * (70 cols * 8px + SCROLLBAR_WIDTH, 20 rows * 16px)
      * + title bar + menu bar + borders */
-    int16_t client_w = TERM_COLS * TERM_FONT_W;  /* 560 */
+    int16_t client_w = TERM_COLS * TERM_FONT_W + SCROLLBAR_WIDTH;  /* 576 */
     int16_t client_h = TERM_ROWS * TERM_FONT_H;  /* 320 */
     int16_t outer_w = client_w + 2 * THEME_BORDER_WIDTH;
     int16_t outer_h = client_h + THEME_TITLE_HEIGHT + THEME_MENU_HEIGHT +
@@ -411,7 +595,7 @@ hwnd_t terminal_create(void) {
     t->hwnd = wm_create_window(
         10, 10, outer_w, outer_h,
         L(STR_TERMINAL),
-        WF_CLOSABLE | WF_MOVABLE | WF_RESIZABLE | WF_BORDER | WF_MENUBAR | WF_FULLSCREENABLE | WF_HIDE_CURSOR,
+        WF_CLOSABLE | WF_MOVABLE | WF_RESIZABLE | WF_BORDER | WF_MENUBAR | WF_FULLSCREENABLE,
         terminal_event,
         terminal_paint
     );
@@ -471,6 +655,13 @@ void terminal_destroy(terminal_t *t) {
     if (t->textbuf) {
         psram_free(t->textbuf);
         t->textbuf = NULL;
+    }
+
+    /* Free scrollback: all line cell buffers, then the slot ring (SRAM) */
+    if (t->sb_slot) {
+        sb_clear(t);
+        vPortFree(t->sb_slot);
+        t->sb_slot = NULL;
     }
 
     /* Free the terminal struct itself */
@@ -617,7 +808,8 @@ int terminal_getch_now(terminal_t *t) {
 void terminal_resize(terminal_t *t, int client_w, int client_h) {
     if (!t || !t->textbuf) return;
 
-    int new_cols = client_w / TERM_FONT_W;
+    /* Reserve the right edge for the scrollbar; the rest is text columns. */
+    int new_cols = (client_w - SCROLLBAR_WIDTH) / TERM_FONT_W;
     int new_rows = client_h / TERM_FONT_H;
 
     /* Clamp to valid range */
@@ -663,6 +855,12 @@ void terminal_resize(terminal_t *t, int client_w, int client_h) {
 
     /* Free old buffer */
     psram_free(old_buf);
+
+    /* Stored lines are clamped to the old column count, so drop history on a
+     * resize (reflowing wrapped lines across a new width is out of scope).
+     * The slot ring itself is column-independent and is reused as-is. */
+    if (t->sb_slot)
+        sb_clear(t);
 
     /* Clamp cursor */
     if (t->cursor_col >= new_cols) t->cursor_col = new_cols - 1;
