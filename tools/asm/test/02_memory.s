@@ -1,0 +1,17 @@
+.syntax unified
+.thumb
+	ldr	r0, [r1, #4]
+	ldr	r2, [r3]
+	str	r4, [r5, #20]
+	ldrb	r0, [r1, #3]
+	strb	r2, [r3, #1]
+	ldrh	r4, [r5, #6]
+	strh	r6, [r7, #2]
+	ldr	r0, [r1, r2]
+	str	r3, [r4, r5]
+	ldrb	r6, [r7, r0]
+	ldrh	r1, [r2, r3]
+	ldrsb	r4, [r5, r6]
+	ldrsh	r7, [r0, r1]
+	ldr	r0, [sp, #8]
+	str	r3, [sp, #16]
