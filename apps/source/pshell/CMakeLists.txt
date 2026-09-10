@@ -25,6 +25,7 @@ add_executable(${PROJECT_NAME}
     misc/readln.c
     misc/tar.c
     disassembler/armdisasm.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../assembler/asm_thumb.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../src/font8x16.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../api/m-os-api-sdtfn.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../api/m-os-api-math.c
@@ -40,6 +41,7 @@ target_include_directories(${PROJECT_NAME} BEFORE PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/vi
     ${CMAKE_CURRENT_SOURCE_DIR}/misc
     ${CMAKE_CURRENT_SOURCE_DIR}/disassembler
+    ${CMAKE_CURRENT_SOURCE_DIR}/../assembler
 )
 
 target_link_options(${PROJECT_NAME} PRIVATE

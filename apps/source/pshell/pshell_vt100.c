@@ -156,53 +156,28 @@ static inline void render_cell(uint8_t *fb, int16_t stride,
     }
 }
 
-/* Flush pending changes — render dirty cells directly to cached framebuffer.
- * Falls back to wm_invalidate() if no cached pointer is available yet.
- * Called from getch (natural end-of-output-burst) and cursor blink timer. */
+/* Flush pending changes by requesting a compositor repaint.
+ *
+ * The old fast path rendered dirty cells directly into a framebuffer
+ * pointer cached during vt100_paint().  That broke under the flicker-
+ * free compositor: wm_composite() can redirect ALL drawing to an
+ * off-screen PSRAM shadow mid-frame (display_redirect_draw) and blit it
+ * back.  A pointer cached while painting into that shadow became stale
+ * the instant drawing was restored to the live buffer, so subsequent
+ * terminal output landed off-screen — the "cursor only, text flashes on
+ * close" regression.  Routing output through the paint callback instead
+ * always renders into the compositor's current draw buffer (live or
+ * shadow), which is always correct.  A content-only invalidation is not
+ * a "flashy" repaint, so the compositor still paints it live with no
+ * flicker.  Called from getch (end-of-output-burst) and the blink timer. */
 static void flush_display(void) {
     if (!vt_dirty || g_vt_hwnd == 0) return;
-
-    /* When inactive (no focus), keep vt_dirty set but don't write to
-     * the framebuffer — the next vt100_paint() or refocus will pick
-     * up the pending changes. */
-    if (!vt_active) return;
-
     vt_dirty = false;
-
-    uint8_t *fb = cached_fb;
-    if (!fb || !textbuf) {
-        /* No cached framebuffer yet — fall back to WM round-trip */
-        wm_invalidate(g_vt_hwnd);
-        return;
-    }
-
-    int16_t stride = cached_stride;
-    int vis_cols = cached_clip_w / VT100_FONT_W;
-    int vis_rows = cached_clip_h / VT100_FONT_H;
-    if (vis_cols > tb_cols) vis_cols = tb_cols;
-    if (vis_rows > tb_rows) vis_rows = tb_rows;
-
-    for (int row = 0; row < vis_rows; row++) {
-        for (int col = 0; col < vis_cols; col++) {
-            int off = TB_OFF(row, col);
-            uint8_t ch   = textbuf[off];
-            uint8_t attr = textbuf[off + 1];
-
-            /* Apply cursor inversion */
-            bool is_cursor = (row == cursor_row && col == cursor_col
-                              && cursor_visible && cursor_enabled);
-            uint8_t eff_attr = is_cursor ? (uint8_t)((attr >> 4) | (attr << 4))
-                                         : attr;
-
-            /* Skip unchanged cells */
-            if (shadow_buf[off] == ch && shadow_buf[off + 1] == eff_attr)
-                continue;
-            shadow_buf[off]     = ch;
-            shadow_buf[off + 1] = eff_attr;
-
-            render_cell(fb, stride, row, col, ch, eff_attr);
-        }
-    }
+    /* Request a compositor repaint.  wm_invalidate() itself no-ops for a
+     * non-focused window, so we don't gate on vt_active here — that gate
+     * could stick closed across a focus-event race and suppress all
+     * repaints while the window was still focused. */
+    wm_invalidate(g_vt_hwnd);
 }
 
 /* ═════════════════════════════════════════════════════════════════════════
@@ -727,11 +702,9 @@ void vt100_invalidate(void) {
  * ═════════════════════════════════════════════════════════════════════════ */
 
 void vt100_toggle_cursor(void) {
-    if (!vt_active) return;          /* no-op when unfocused */
     cursor_visible = !cursor_visible;
-    /* Mark dirty so flush_display() re-evaluates the cursor cell
-     * (shadow has old cursor state → comparison fails → cell re-rendered).
-     * Also flushes any pending text output. */
+    /* Mark dirty and request a repaint (the blink timer is stopped while
+     * unfocused, so no vt_active gate is needed here). */
     vt_dirty = true;
     flush_display();
 }

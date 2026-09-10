@@ -133,8 +133,6 @@ static bool pshell_event(hwnd_t hwnd, const window_event_t *event) {
 
     if (event->type == WM_SETFOCUS) {
         vt100_set_active(true);                   /* re-enable FB writes */
-        /* Resume the shell task so it can process I/O again */
-        if (g_shell_task) vTaskResume(g_shell_task);
         if (g_blink_tmr) xTimerStart(g_blink_tmr, 0);
         wm_invalidate(hwnd);                      /* trigger full repaint */
         return true;
@@ -143,11 +141,17 @@ static bool pshell_event(hwnd_t hwnd, const window_event_t *event) {
     if (event->type == WM_KILLFOCUS) {
         if (g_blink_tmr) xTimerStop(g_blink_tmr, 0);
         vt100_set_active(false);                  /* suppress FB writes */
-        /* Suspend the shell task so it cannot write to the framebuffer
-         * while another window is in the foreground. */
-        if (g_shell_task) vTaskSuspend(g_shell_task);
         return true;
     }
+    /* NOTE: we deliberately do NOT vTaskSuspend/Resume the shell task on
+     * focus changes.  The OS swap system already suspends/resumes the app
+     * task when switching foreground apps, and it does so paired with the
+     * shared-stack save/restore.  pshell doing its own vTaskSuspend on
+     * WM_KILLFOCUS raced the swap system: a stray/last KILLFOCUS at launch
+     * self-suspended the task, and wm_set_focus re-focuses the window
+     * WITHOUT resuming (focus and swap are decoupled) — leaving pshell
+     * "focused but frozen" (blank window, banner only, no input).
+     * vt100_set_active() alone gives us the needed FB-write suppression. */
 
     /* WM_CHAR: printable ASCII characters */
     if (event->type == WM_CHAR) {

@@ -25,6 +25,7 @@
 #endif
 
 #include "cc.h"
+#include "asm_thumb.h"    /* native Thumb-16 assembler core (apps/source/assembler) */
 #ifndef PSHELL_FRANKOS
 #include "io.h"
 #endif
@@ -986,8 +987,147 @@ static void clear_cmd(void) {
 #endif
 }
 
+/* asm — assemble a Thumb-16 source file (asm_thumb.c core).
+ *   asm <src>              assemble, report result / errors
+ *   asm <src> -o <out.o>   also write a relocatable ELF object
+ *   asm <src> -c [name]    also print a CSUB block (entry label 'main')
+ *   asm <src> -l           also list symbols
+ * Thumb-16 only; a 'main' or '_start' label marks the entry. */
+static void asm_cmd(void) {
+    if (argc < 2 || strcmp(argv[1], "-h") == 0) {
+        printf("usage: asm <source> [-o <file>] [-c [name]] [-l]\n"
+               "  -o F.o    write a relocatable ELF object to F.o\n"
+               "  -o F.inc  write a CSUB include file (MERGE it in MMBASIC)\n"
+               "  -c [N]    print a CSUB block to screen (name N, default 'code')\n"
+               "  -l        list symbols\n"
+               "Thumb-16 only; 'main' or '_start' marks the entry.\n");
+        return;
+    }
+    if (check_mount(true))
+        return;
+
+    const char *src_name = NULL, *out_name = NULL, *csub_name = NULL;
+    int want_csub = 0, want_list = 0;
+    for (int a = 1; a < argc; a++) {
+        if (strcmp(argv[a], "-o") == 0 && a + 1 < argc)
+            out_name = argv[++a];
+        else if (strcmp(argv[a], "-c") == 0) {
+            want_csub = 1;
+            if (a + 1 < argc && argv[a + 1][0] != '-')
+                csub_name = argv[++a];
+        } else if (strcmp(argv[a], "-l") == 0)
+            want_list = 1;
+        else if (argv[a][0] != '-')
+            src_name = argv[a];
+    }
+    if (!src_name) {
+        strcpy(result, "source file argument is required");
+        return;
+    }
+
+    /* read the source file */
+    lfs_file_t f;
+    char *fp = full_path(src_name);
+    if (fs_file_open(&f, fp, LFS_O_RDONLY) < LFS_ERR_OK) {
+        snprintf(result, sizeof(result), "error opening %s", fp);
+        return;
+    }
+    int len = fs_file_seek(&f, 0, LFS_SEEK_END);
+    fs_file_seek(&f, 0, LFS_SEEK_SET);
+    char *src = malloc(len + 1);
+    if (!src) {
+        fs_file_close(&f);
+        strcpy(result, "insufficient memory");
+        return;
+    }
+    if (fs_file_read(&f, src, len) != len) {
+        free(src);
+        fs_file_close(&f);
+        snprintf(result, sizeof(result), "error reading %s", fp);
+        return;
+    }
+    src[len] = 0;
+    fs_file_close(&f);
+
+    /* assemble (asm_ctx is large ~100 KB — heap, not stack) */
+    asm_ctx *ctx = malloc(sizeof(asm_ctx));
+    if (!ctx) {
+        free(src);
+        strcpy(result, "insufficient memory");
+        return;
+    }
+    int rc = asm_assemble(ctx, src);
+    free(src);
+
+    if (rc != 0) {
+        for (int i = 0; i < ctx->nerr; i++)
+            printf("  line %d: %s\n", ctx->err[i].line, ctx->err[i].msg);
+        snprintf(result, sizeof(result), "assembly failed (%d error%s)",
+                 ctx->nerr, ctx->nerr == 1 ? "" : "s");
+        free(ctx);
+        return;
+    }
+
+    if (want_list)
+        for (int i = 0; i < ctx->nsym; i++)
+            if (ctx->sym[i].defined)
+                printf("  %08X %s%s\n", ctx->sym[i].value,
+                       ctx->sym[i].is_equ ? "= " : "  ", ctx->sym[i].name);
+
+    if (want_csub) {
+        int cap = (int)ctx->code_len * 3 + 256;
+        char *out = malloc(cap);
+        if (out) {
+            const char *nm = csub_name ? csub_name : "code";
+            if (asm_emit_csub(ctx, nm, "integer, integer, integer, integer", out, cap) > 0)
+                printf("%s", out);
+            free(out);
+        }
+    }
+
+    if (out_name) {
+        /* Output format by extension: ".o" => ELF object; anything else
+         * => a CSUB text include (MERGE/LIBRARY-able from MMBASIC). */
+        int ol = (int)strlen(out_name);
+        int is_obj = (ol >= 2 && out_name[ol - 2] == '.' &&
+                      (out_name[ol - 1] == 'o' || out_name[ol - 1] == 'O'));
+        lfs_file_t of;
+        char *ofp = full_path(out_name);
+        if (is_obj) {
+            int cap = (int)ctx->code_len + 4096;
+            uint8_t *obj = malloc(cap);
+            int k = obj ? asm_emit_elf(ctx, 0, obj, cap) : -1;
+            if (k > 0) {
+                if (fs_file_open(&of, ofp, LFS_O_WRONLY | LFS_O_CREAT | LFS_O_TRUNC) >= LFS_ERR_OK) {
+                    fs_file_write(&of, obj, k); fs_file_close(&of);
+                    snprintf(result, sizeof(result), "wrote %s (ELF object, %d bytes)", out_name, k);
+                } else snprintf(result, sizeof(result), "error writing %s", ofp);
+            } else strcpy(result, "ELF emit failed");
+            if (obj) free(obj);
+        } else {
+            int cap = (int)ctx->code_len * 3 + 256;
+            char *out = malloc(cap);
+            const char *nm = csub_name ? csub_name : "code";
+            int k = out ? asm_emit_csub(ctx, nm, "integer, integer, integer, integer", out, cap) : -1;
+            if (k > 0) {
+                if (fs_file_open(&of, ofp, LFS_O_WRONLY | LFS_O_CREAT | LFS_O_TRUNC) >= LFS_ERR_OK) {
+                    fs_file_write(&of, out, (int)strlen(out)); fs_file_close(&of);
+                    snprintf(result, sizeof(result), "wrote %s (CSUB %s) - MERGE it in MMBASIC", out_name, nm);
+                } else snprintf(result, sizeof(result), "error writing %s", ofp);
+            } else strcpy(result, "CSUB emit failed");
+            if (out) free(out);
+        }
+    }
+
+    if (!result[0])
+        snprintf(result, sizeof(result), "%u bytes, entry +%u, %d symbol%s",
+                 ctx->code_len, ctx->entry, ctx->nsym, ctx->nsym == 1 ? "" : "s");
+    free(ctx);
+}
+
 // clang-format off
 const cmd_t cmd_table[] = {
+    {"asm",     asm_cmd,        "assemble Thumb-16 source. asm -h for help"},
     {"cat",     cat_cmd,        "display a text file, use -p to paginate"},
     {"cc",      cc_cmd,         "compile & run C source file. cc -h for help"},
     {"cd",      cd_cmd,         "change directory"},
