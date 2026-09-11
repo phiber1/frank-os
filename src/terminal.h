@@ -91,6 +91,14 @@ struct terminal {
     uint8_t  fg_color, bg_color;
     bool     cursor_visible;
 
+    /* Text selection (mouse drag → clipboard), in virtual-row coordinates
+     * (0 = oldest scrollback line .. sb_count = first live row) so a selection
+     * stays anchored to its text as the view scrolls. */
+    bool     sel_active;     /* a non-empty selection exists */
+    bool     sel_dragging;   /* left button held, extending the selection */
+    int      sel_a_row, sel_a_col;   /* anchor (drag start) */
+    int      sel_b_row, sel_b_col;   /* current end */
+
     /* Keyboard input ring buffer (for terminal_getch) */
     uint8_t  input_buf[64];
     uint8_t  in_head, in_tail;

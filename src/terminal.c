@@ -25,6 +25,7 @@
 #include "psram.h"
 #include "lang.h"
 #include "cmd.h"
+#include "clipboard.h"
 #include "pico/platform.h"
 
 /*==========================================================================
@@ -202,6 +203,130 @@ static void terminal_snap_bottom(terminal_t *t) {
 }
 
 /*==========================================================================
+ * Text selection + clipboard (console-host feature)
+ *
+ * Selection is stored in virtual-row coordinates: row 0 is the oldest
+ * scrollback line, row sb_count is the first live textbuf row.  Copy/paste
+ * and highlight all work off these, so a selection stays put as the view
+ * scrolls.  Kept out of SRAM (plain flash functions) — no PSRAM here.
+ *=========================================================================*/
+
+/* Fill buf (>= t->cols chars) with the characters of virtual row `vrow`,
+ * space-padded to the full width; returns the length with trailing spaces
+ * trimmed.  Returns 0 for out-of-range rows. */
+static int term_virtual_row_text(terminal_t *t, int vrow, char *buf) {
+    int cols = t->cols;
+    if (vrow < 0 || vrow >= t->sb_count + t->rows) return 0;
+    if (t->sb_slot && vrow < t->sb_count) {
+        int ring = (t->sb_head - t->sb_count + vrow + t->sb_lines) % t->sb_lines;
+        sb_line_t *e = &t->sb_slot[ring];
+        int n = e->cells ? e->len : 0;
+        if (n > cols) n = cols;
+        for (int c = 0; c < n; c++)    buf[c] = (char)e->cells[c * 2];
+        for (int c = n; c < cols; c++) buf[c] = ' ';
+    } else {
+        int tr = vrow - t->sb_count;
+        volatile uint8_t *src = t->textbuf + tr * cols * 2;
+        for (int c = 0; c < cols; c++) buf[c] = (char)src[c * 2];
+    }
+    int len = cols;
+    while (len > 0 && buf[len - 1] == ' ') len--;
+    return len;
+}
+
+/* Normalize the selection into reading order (r0,c0) <= (r1,c1).
+ * Returns false when there is no active selection. */
+static bool term_selection_norm(terminal_t *t, int *r0, int *c0,
+                                int *r1, int *c1) {
+    if (!t->sel_active) return false;
+    int ar = t->sel_a_row, ac = t->sel_a_col;
+    int br = t->sel_b_row, bc = t->sel_b_col;
+    if (br < ar || (br == ar && bc < ac)) {
+        *r0 = br; *c0 = bc; *r1 = ar; *c1 = ac;
+    } else {
+        *r0 = ar; *c0 = ac; *r1 = br; *c1 = bc;
+    }
+    return true;
+}
+
+/* Column span [start, end) selected on virtual row `vrow`. */
+static void term_selection_row_span(int r0, int c0, int r1, int c1,
+                                    int vrow, int cols,
+                                    int *start, int *end) {
+    if (vrow < r0 || vrow > r1) { *start = 0; *end = 0; return; }
+    *start = (vrow == r0) ? c0 : 0;
+    *end   = (vrow == r1) ? c1 + 1 : cols;
+    if (*end > cols) *end = cols;
+    if (*start < 0) *start = 0;
+}
+
+/* Gather the selected text and put it on the clipboard.  Builds into a heap
+ * temp buffer (capped at the clipboard size) to avoid a large static/stack. */
+static void term_copy_selection(terminal_t *t) {
+    int r0, c0, r1, c1;
+    if (!term_selection_norm(t, &r0, &c0, &r1, &c1)) return;
+
+    char *out = (char *)pvPortMalloc(CLIPBOARD_MAX_SIZE);
+    if (!out) return;
+    char rowbuf[TERM_MAX_COLS];
+    int olen = 0;
+
+    for (int vr = r0; vr <= r1 && olen < CLIPBOARD_MAX_SIZE; vr++) {
+        int rlen = term_virtual_row_text(t, vr, rowbuf);
+        int start, end;
+        term_selection_row_span(r0, c0, r1, c1, vr, t->cols, &start, &end);
+        /* Clamp the copied span to actual content (trim trailing blanks) */
+        if (end > rlen) end = rlen;
+        for (int c = start; c < end && olen < CLIPBOARD_MAX_SIZE; c++)
+            out[olen++] = rowbuf[c];
+        if (vr != r1 && olen < CLIPBOARD_MAX_SIZE)
+            out[olen++] = '\n';
+    }
+    clipboard_set_text(out, (uint16_t)olen);
+    vPortFree(out);
+}
+
+/* Paste the clipboard into the terminal input, as if typed. */
+static void term_paste(terminal_t *t) {
+    const char *s = clipboard_get_text();
+    if (!s) return;
+    while (*s) terminal_input_push(t, (uint8_t)*s++);
+}
+
+static void term_select_all(terminal_t *t) {
+    t->sel_a_row = 0;             t->sel_a_col = 0;
+    t->sel_b_row = t->sb_count + t->rows - 1;
+    t->sel_b_col = t->cols - 1;
+    t->sel_active = true;
+    wm_invalidate(t->hwnd);
+}
+
+static void term_clear_selection(terminal_t *t) {
+    if (t->sel_active || t->sel_dragging) {
+        t->sel_active = false;
+        t->sel_dragging = false;
+        wm_invalidate(t->hwnd);
+    }
+}
+
+/* Invert fg/bg of the selected cells in the freshly-built paint_shadow.
+ * Runs from flash (noinline) so the SRAM-resident render loop is untouched. */
+static __attribute__((noinline)) void apply_selection_highlight(
+        terminal_t *t, uint8_t *shadow, int term_cols, int term_rows) {
+    int r0, c0, r1, c1;
+    if (!term_selection_norm(t, &r0, &c0, &r1, &c1)) return;
+    for (int r = 0; r < term_rows; r++) {
+        int vrow = t->sb_count - t->view_offset + r;
+        int start, end;
+        term_selection_row_span(r0, c0, r1, c1, vrow, term_cols, &start, &end);
+        for (int c = start; c < end; c++) {
+            uint8_t *attr = &shadow[(r * term_cols + c) * 2 + 1];
+            *attr = TB_PACK(TB_BG(*attr), TB_FG(*attr));  /* swap fg/bg */
+        }
+    }
+}
+
+/*==========================================================================
  * Terminal ↔ Window association via user_data pointer
  *=========================================================================*/
 
@@ -271,6 +396,11 @@ static void __not_in_flash_func(terminal_paint)(hwnd_t hwnd) {
     } else {
         sb_build_shadow(t, paint_shadow, term_cols, term_rows);
     }
+
+    /* Overlay the selection highlight (fg/bg swap) into the shadow so the
+     * render loop below needs no per-cell selection logic. */
+    if (t->sel_active)
+        apply_selection_highlight(t, paint_shadow, term_cols, term_rows);
 
     /* Compute client-area origin in screen coordinates directly,
      * bypassing wd_begin/wd_end to avoid per-pixel clipping overhead. */
@@ -362,7 +492,24 @@ static void __not_in_flash_func(terminal_paint)(hwnd_t hwnd) {
 
 /* Terminal menu command IDs */
 #define TCMD_FILE_EXIT    1
+#define TCMD_EDIT_COPY   10
+#define TCMD_EDIT_PASTE  11
+#define TCMD_EDIT_SELALL 12
 #define TCMD_HELP_ABOUT 100
+
+/* Map a client-relative mouse position to a (virtual row, column) cell.
+ * Returns false if the point is over the scrollbar or outside the text. */
+static bool term_mouse_cell(terminal_t *t, int16_t mx, int16_t my,
+                            int *vrow, int *col) {
+    if (mx < 0 || mx >= t->vsb.x) return false;
+    int c = mx / TERM_FONT_W;
+    int r = my / TERM_FONT_H;
+    if (c < 0) c = 0; else if (c >= t->cols) c = t->cols - 1;
+    if (r < 0) r = 0; else if (r >= t->rows) r = t->rows - 1;
+    *col = c;
+    *vrow = t->sb_count - t->view_offset + r;
+    return true;
+}
 
 /* Force-close: signal shell, destroy window immediately */
 static void terminal_force_close(terminal_t *t, hwnd_t hwnd) {
@@ -395,6 +542,12 @@ static bool terminal_event(hwnd_t hwnd, const window_event_t *event) {
 
     switch (event->type) {
     case WM_CHAR:
+        /* Ctrl+Shift+<key> are copy/paste shortcuts handled in WM_KEYDOWN;
+         * swallow their control-char WM_CHAR so it isn't injected as input.
+         * Plain Ctrl+C (no Shift) still reaches the shell as interrupt. */
+        if ((event->charev.modifiers & KMOD_CTRL) &&
+            (event->charev.modifiers & KMOD_SHIFT))
+            return true;
         terminal_snap_bottom(t);   /* typing jumps to live output */
         terminal_input_push(t, (uint8_t)event->charev.ch);
         return true;
@@ -403,27 +556,56 @@ static bool terminal_event(hwnd_t hwnd, const window_event_t *event) {
         terminal_resize(t, event->size.w, event->size.h);
         return true;
 
+    case WM_RBUTTONDOWN:
+        term_paste(t);             /* right-click pastes the clipboard */
+        return true;
+
     case WM_MOUSEMOVE:
     case WM_LBUTTONDOWN:
     case WM_LBUTTONUP: {
-        /* The terminal's scrollbar is line-measured, but the shared
-         * scrollbar_event uses a pixel-sized arrow step.  So handle the
-         * arrow buttons here as a 1-line step and let scrollbar_event own
-         * the track and thumb-drag. */
+        int cell_row, cell_col;
+
         if (event->type == WM_LBUTTONDOWN) {
             int16_t mx = event->mouse.x, my = event->mouse.y;
+            /* Scrollbar arrows: 1-line step (shared scrollbar_event uses a
+             * pixel-sized step); track/thumb fall through to scrollbar_event. */
             if (mx >= t->vsb.x && mx < t->vsb.x + t->vsb.w &&
                 my >= t->vsb.y && my < t->vsb.y + t->vsb.h) {
                 if (my < t->vsb.y + SCROLLBAR_WIDTH) {
-                    terminal_scroll_view(t, 1);   /* up arrow → older */
+                    terminal_scroll_view(t, 1);
                     return true;
                 }
                 if (my >= t->vsb.y + t->vsb.h - SCROLLBAR_WIDTH) {
-                    terminal_scroll_view(t, -1);  /* down arrow → newer */
+                    terminal_scroll_view(t, -1);
                     return true;
                 }
             }
+            /* Text area: begin a selection (clears any previous one). */
+            else if (term_mouse_cell(t, mx, my, &cell_row, &cell_col)) {
+                t->sel_a_row = t->sel_b_row = cell_row;
+                t->sel_a_col = t->sel_b_col = cell_col;
+                t->sel_dragging = true;
+                t->sel_active = false;   /* becomes active once it spans a cell */
+                wm_invalidate(hwnd);
+                return true;
+            }
+        } else if (event->type == WM_MOUSEMOVE && t->sel_dragging) {
+            /* Extend the in-progress selection. */
+            if (term_mouse_cell(t, event->mouse.x, event->mouse.y,
+                                &cell_row, &cell_col)) {
+                t->sel_b_row = cell_row;
+                t->sel_b_col = cell_col;
+                t->sel_active = (cell_row != t->sel_a_row ||
+                                 cell_col != t->sel_a_col);
+                wm_invalidate(hwnd);
+            }
+            return true;
+        } else if (event->type == WM_LBUTTONUP && t->sel_dragging) {
+            t->sel_dragging = false;
+            if (t->sel_active) term_copy_selection(t);  /* select-to-copy */
+            return true;
         }
+
         /* Route to the scrollbar (client-relative coords).  new_pos is the
          * top virtual line; convert back to a view_offset from the bottom. */
         int32_t new_pos;
@@ -441,6 +623,13 @@ static bool terminal_event(hwnd_t hwnd, const window_event_t *event) {
     }
 
     case WM_KEYDOWN:
+        /* Copy/paste: Ctrl+Shift+C / Ctrl+Shift+V (Ctrl+C stays as interrupt).
+         * HID usage: C = 0x06, V = 0x19. */
+        if ((event->key.modifiers & KMOD_CTRL) &&
+            (event->key.modifiers & KMOD_SHIFT)) {
+            if (event->key.scancode == 0x06) { term_copy_selection(t); return true; }
+            if (event->key.scancode == 0x19) { term_paste(t);          return true; }
+        }
         /* Scrollback view controls (HID usage codes).  These are consumed by
          * the host and never reach the client. */
         switch (event->key.scancode) {
@@ -471,6 +660,15 @@ static bool terminal_event(hwnd_t hwnd, const window_event_t *event) {
         switch (event->command.id) {
         case TCMD_FILE_EXIT:
             terminal_force_close(t, hwnd);
+            return true;
+        case TCMD_EDIT_COPY:
+            term_copy_selection(t);
+            return true;
+        case TCMD_EDIT_PASTE:
+            term_paste(t);
+            return true;
+        case TCMD_EDIT_SELALL:
+            term_select_all(t);
             return true;
         case TCMD_HELP_ABOUT:
             dialog_show(hwnd, L(STR_ABOUT_TERMINAL),
@@ -504,7 +702,7 @@ static bool terminal_event(hwnd_t hwnd, const window_event_t *event) {
 void terminal_setup_menu(terminal_t *t) {
     menu_bar_t bar;
     memset(&bar, 0, sizeof(bar));
-    bar.menu_count = 2;
+    bar.menu_count = 3;
 
     menu_def_t *file = &bar.menus[0];
     strncpy(file->title, L(STR_FILE), sizeof(file->title) - 1);
@@ -513,7 +711,18 @@ void terminal_setup_menu(terminal_t *t) {
     strncpy(file->items[0].text, L(STR_FM_EXIT), sizeof(file->items[0].text) - 1);
     file->items[0].command_id = TCMD_FILE_EXIT;
 
-    menu_def_t *help = &bar.menus[1];
+    menu_def_t *edit = &bar.menus[1];
+    strncpy(edit->title, L(STR_EDIT), sizeof(edit->title) - 1);
+    edit->accel_key = 0x08;   /* 'E' */
+    edit->item_count = 3;
+    strncpy(edit->items[0].text, L(STR_APP_COPY), sizeof(edit->items[0].text) - 1);
+    edit->items[0].command_id = TCMD_EDIT_COPY;
+    strncpy(edit->items[1].text, L(STR_APP_PASTE), sizeof(edit->items[1].text) - 1);
+    edit->items[1].command_id = TCMD_EDIT_PASTE;
+    strncpy(edit->items[2].text, L(STR_APP_SELECT_ALL), sizeof(edit->items[2].text) - 1);
+    edit->items[2].command_id = TCMD_EDIT_SELALL;
+
+    menu_def_t *help = &bar.menus[2];
     strncpy(help->title, L(STR_HELP), sizeof(help->title) - 1);
     help->accel_key = 0x0B;
     help->item_count = 1;
@@ -612,8 +821,15 @@ hwnd_t terminal_create(void) {
     int16_t outer_h = client_h + THEME_TITLE_HEIGHT + THEME_MENU_HEIGHT +
                       2 * THEME_BORDER_WIDTH;
 
+    /* Cascade each new Terminal so multiple instances are visibly distinct
+     * instead of stacking exactly on top of one another. */
+    static int cascade_n = 0;
+    int16_t win_x = 10 + (cascade_n % 6) * 24;
+    int16_t win_y = 10 + (cascade_n % 6) * 24;
+    cascade_n++;
+
     t->hwnd = wm_create_window(
-        10, 10, outer_w, outer_h,
+        win_x, win_y, outer_w, outer_h,
         L(STR_TERMINAL),
         WF_CLOSABLE | WF_MOVABLE | WF_RESIZABLE | WF_BORDER | WF_MENUBAR | WF_FULLSCREENABLE,
         terminal_event,
@@ -884,6 +1100,9 @@ void terminal_resize(terminal_t *t, int client_w, int client_h) {
     /* Clamp cursor */
     if (t->cursor_col >= new_cols) t->cursor_col = new_cols - 1;
     if (t->cursor_row >= new_rows) t->cursor_row = new_rows - 1;
+
+    /* Drop any selection — its column coords may exceed the new width */
+    term_clear_selection(t);
 
     /* Full repaint — resize is a structural change that needs the frame
      * background refilled to clear stale pixels outside the new grid. */

@@ -39,6 +39,7 @@
 #include "run_dialog.h"
 #include "file_assoc.h"
 #include "desktop.h"
+#include "dialog.h"
 #include "sysmenu.h"
 #include "filemanager.h"
 #include "cursor.h"
@@ -714,6 +715,9 @@ void spawn_terminal_window(void) {
     hwnd_t hwnd = terminal_create();
     if (hwnd == HWND_NULL) {
         printf("spawn_terminal_window: out of memory\n");
+        dialog_show(HWND_NULL, "Terminal",
+                    "Not enough memory to open another Terminal.",
+                    DLG_ICON_WARNING, DLG_BTN_OK);
         return;
     }
     terminal_t *t = terminal_from_hwnd(hwnd);
@@ -721,6 +725,9 @@ void spawn_terminal_window(void) {
     if (!shell_start(t)) {
         printf("spawn_terminal_window: shell_start failed\n");
         terminal_destroy(t);
+        dialog_show(HWND_NULL, "Terminal",
+                    "Not enough memory to open another Terminal.",
+                    DLG_ICON_WARNING, DLG_BTN_OK);
         return;
     }
     wm_set_focus(hwnd);
