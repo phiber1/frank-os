@@ -1120,6 +1120,11 @@ static void blink_cb(TimerHandle_t t)
  * Frank OS app entry point
  * ═════════════════════════════════════════════════════════════════════════ */
 
+/* Serial-only formatted debug (frankos_platform.c).  Bring-up diagnostics use
+ * this instead of printf, which (via the m-os-api macro) routes to whatever
+ * Terminal window is focused when this app launches — polluting the console. */
+extern void serial_dbgf(const char *fmt, ...);
+
 int main(int argc, char **argv)
 {
     /* ── Singleton: if already running, focus existing window ──── */
@@ -1129,9 +1134,9 @@ int main(int argc, char **argv)
         return 0;
     }
 
-    printf("[basic] main() start\n");
+    serial_dbgf("[basic] main() start\n");
     g_task = xTaskGetCurrentTaskHandle();
-    printf("[basic] task handle: %p\n", (void*)g_task);
+    serial_dbgf("[basic] task handle: %p\n", (void*)g_task);
 
     /* Store autorun path from file association launch */
     g_autorun_path[0] = '\0';
@@ -1144,14 +1149,14 @@ int main(int argc, char **argv)
     if (!g_textbuf)
         g_textbuf = (volatile cell_t (*)[BASIC_COLS])
                     calloc(BASIC_ROWS, sizeof(*g_textbuf));
-    printf("[basic] g_textbuf: %p\n", (void*)g_textbuf);
+    serial_dbgf("[basic] g_textbuf: %p\n", (void*)g_textbuf);
     if (!g_textbuf) {
-        printf("[basic] FATAL: g_textbuf calloc failed\n");
+        serial_dbgf("[basic] FATAL: g_textbuf calloc failed\n");
         return 1;  /* fatal: no display buffer */
     }
 
     tbuf_clear();
-    printf("[basic] tbuf_clear done\n");
+    serial_dbgf("[basic] tbuf_clear done\n");
 
     /* Centre the window (no taskbar overlap). */
     int16_t fw = (int16_t)BASIC_WIN_W;
@@ -1159,14 +1164,14 @@ int main(int argc, char **argv)
     int16_t x  = (int16_t)((DISPLAY_WIDTH  - fw) / 2);
     int16_t y  = (int16_t)((DISPLAY_HEIGHT - TASKBAR_HEIGHT - fh) / 2);
     if (y < 0) y = 0;
-    printf("[basic] wm_create_window %dx%d at (%d,%d)\n", fw, fh, x, y);
+    serial_dbgf("[basic] wm_create_window %dx%d at (%d,%d)\n", fw, fh, x, y);
 
     g_hwnd = wm_create_window(x, y, fw, fh, "MMBasic",
                               WSTYLE_DIALOG | WF_FULLSCREENABLE | WF_NOCLEAR,
                               basic_event, basic_paint);
-    printf("[basic] g_hwnd: %p\n", (void*)(uintptr_t)g_hwnd);
+    serial_dbgf("[basic] g_hwnd: %p\n", (void*)(uintptr_t)g_hwnd);
     if (g_hwnd == HWND_NULL) {
-        printf("[basic] FATAL: wm_create_window returned NULL\n");
+        serial_dbgf("[basic] FATAL: wm_create_window returned NULL\n");
         return 1;
     }
 

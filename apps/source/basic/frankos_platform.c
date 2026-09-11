@@ -32,6 +32,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <setjmp.h>
+#include <stdarg.h>
 /* Memory allocation wrappers — see frankos_alloc.c for rationale.
  *
  * pvPortMalloc and pvPortCalloc are NOT bare OS symbols resolvable by the
@@ -443,6 +444,19 @@ void serial_dbg(const char *msg)
     static void * const * const _st = (void * const *)0x10FFF000UL;
     typedef void(*fn)(const char*,...);
     ((fn)_st[438])("%s", msg);
+}
+
+/* Formatted variant of serial_dbg — serial (USB) only, never the console.
+ * Use for bring-up diagnostics so they don't leak into whatever Terminal
+ * window happens to be focused when this app is launched. */
+void serial_dbgf(const char *fmt, ...)
+{
+    char buf[256];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    serial_dbg(buf);
 }
 
 void basic_platform_init(void)

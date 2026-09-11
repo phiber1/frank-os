@@ -318,10 +318,12 @@ void __in_hfa() resolve_thm_pc22(uint16_t* addr, uint16_t* addr_ref, uint32_t sy
         uint32_t target = (uint32_t)addr_ref + 4 + voff;
         uint32_t want   = sym_val & ~1u;
         if (target != want) {
+#if DEBUG_APP_LOAD
             static int bl_mispatch_count;
             if (bl_mispatch_count++ < 20)
                 goutf("[reloc] BL MISPATCH @%p: lands %ph want %ph (off %ph)\n",
                       addr_ref, target, want, new_offset);
+#endif
         }
     }
 }
@@ -376,10 +378,12 @@ static void __in_hfa() resolve_thm_jump24(uint16_t* addr, uint16_t* addr_ref, ui
         uint32_t target = (uint32_t)addr_ref + 4 + voff;
         uint32_t want   = sym_val & ~1u;
         if (target != want) {
+#if DEBUG_APP_LOAD
             static int bw_mispatch_count;
             if (bw_mispatch_count++ < 20)
                 goutf("[reloc] B.W MISPATCH @%p: lands %ph want %ph (off %ph)\n",
                       addr_ref, target, want, new_offset);
+#endif
         }
     }
 }
