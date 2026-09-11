@@ -30,7 +30,6 @@ typedef struct {
     int32_t  range;           /* total content size */
     int32_t  page;            /* visible page size */
     int32_t  pos;             /* current scroll position */
-    int32_t  step;            /* arrow-button step (in range units) */
 
     /* Internal drag state */
     bool     dragging;        /* thumb drag active */

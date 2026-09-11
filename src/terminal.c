@@ -276,14 +276,17 @@ static void __not_in_flash_func(terminal_paint)(hwnd_t hwnd) {
      * bypassing wd_begin/wd_end to avoid per-pixel clipping overhead. */
     window_t *win = wm_get_window(hwnd);
     if (!win) return;
-    int ox, oy;
+    int ox, oy, client_w;
     if (win->flags & WF_BORDER) {
         point_t origin = theme_client_origin(&win->frame, win->flags);
+        rect_t  client = theme_client_rect(&win->frame, win->flags);
         ox = origin.x;
         oy = origin.y;
+        client_w = client.w;
     } else {
         ox = win->frame.x;
         oy = win->frame.y;
+        client_w = win->frame.w;
     }
 
     /* Draw character grid using fast glyph blitter */
@@ -341,7 +344,7 @@ static void __not_in_flash_func(terminal_paint)(hwnd_t hwnd) {
      * wd_* client-drawing API, which is valid here because the compositor
      * wraps every paint handler in wd_begin(hwnd)/wd_end() with the client
      * origin already set — the same origin the grid above was drawn at. */
-    t->vsb.x = term_cols * TERM_FONT_W;      /* just past the last text column */
+    t->vsb.x = client_w - SCROLLBAR_WIDTH;   /* flush against the right edge */
     t->vsb.y = 0;
     t->vsb.w = SCROLLBAR_WIDTH;
     t->vsb.h = term_rows * TERM_FONT_H;
@@ -403,6 +406,24 @@ static bool terminal_event(hwnd_t hwnd, const window_event_t *event) {
     case WM_MOUSEMOVE:
     case WM_LBUTTONDOWN:
     case WM_LBUTTONUP: {
+        /* The terminal's scrollbar is line-measured, but the shared
+         * scrollbar_event uses a pixel-sized arrow step.  So handle the
+         * arrow buttons here as a 1-line step and let scrollbar_event own
+         * the track and thumb-drag. */
+        if (event->type == WM_LBUTTONDOWN) {
+            int16_t mx = event->mouse.x, my = event->mouse.y;
+            if (mx >= t->vsb.x && mx < t->vsb.x + t->vsb.w &&
+                my >= t->vsb.y && my < t->vsb.y + t->vsb.h) {
+                if (my < t->vsb.y + SCROLLBAR_WIDTH) {
+                    terminal_scroll_view(t, 1);   /* up arrow → older */
+                    return true;
+                }
+                if (my >= t->vsb.y + t->vsb.h - SCROLLBAR_WIDTH) {
+                    terminal_scroll_view(t, -1);  /* down arrow → newer */
+                    return true;
+                }
+            }
+        }
         /* Route to the scrollbar (client-relative coords).  new_pos is the
          * top virtual line; convert back to a view_offset from the bottom. */
         int32_t new_pos;
@@ -574,7 +595,6 @@ hwnd_t terminal_create(void) {
     t->view_offset = 0;
     t->sb_slot = (sb_line_t *)pvPortCalloc(t->sb_lines, sizeof(sb_line_t));
     scrollbar_init(&t->vsb, false);
-    t->vsb.step = 1;   /* scrollbar range is in lines — arrows step 1 line */
 
     /* Create input semaphore */
     t->input_sem = xSemaphoreCreateCounting(64, 0);
@@ -856,11 +876,10 @@ void terminal_resize(terminal_t *t, int client_w, int client_h) {
     /* Free old buffer */
     psram_free(old_buf);
 
-    /* Stored lines are clamped to the old column count, so drop history on a
-     * resize (reflowing wrapped lines across a new width is out of scope).
-     * The slot ring itself is column-independent and is reused as-is. */
-    if (t->sb_slot)
-        sb_clear(t);
+    /* Scrollback survives resize: each stored line is variable-length and
+     * self-describing (length + cells), and sb_build_shadow pads or clamps it
+     * to whatever the current column count is — so history is width-
+     * independent and needs no adjustment here. */
 
     /* Clamp cursor */
     if (t->cursor_col >= new_cols) t->cursor_col = new_cols - 1;

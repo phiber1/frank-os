@@ -37,9 +37,6 @@ void scrollbar_init(scrollbar_t *sb, bool horizontal) {
     sb->horizontal = horizontal;
     sb->visible = false;
     sb->dragging = false;
-    /* Default arrow step suits pixel-measured content (one text line).
-     * Line-measured consumers (e.g. the terminal) override this to 1. */
-    sb->step = horizontal ? FONT_UI_WIDTH : FONT_UI_HEIGHT;
 }
 
 /*==========================================================================
@@ -249,8 +246,7 @@ bool scrollbar_event(scrollbar_t *sb, const window_event_t *event,
 
         /* Arrow button 1 (up/left) */
         if (coord < sb_start + SB_W) {
-            int32_t step = sb->step > 0 ? sb->step
-                         : (sb->horizontal ? FONT_UI_WIDTH : FONT_UI_HEIGHT);
+            int32_t step = sb->horizontal ? FONT_UI_WIDTH : FONT_UI_HEIGHT;
             scrollbar_set_pos(sb, sb->pos - step);
             *new_pos = sb->pos;
             return true;
@@ -258,8 +254,7 @@ bool scrollbar_event(scrollbar_t *sb, const window_event_t *event,
 
         /* Arrow button 2 (down/right) */
         if (coord >= sb_end - SB_W) {
-            int32_t step = sb->step > 0 ? sb->step
-                         : (sb->horizontal ? FONT_UI_WIDTH : FONT_UI_HEIGHT);
+            int32_t step = sb->horizontal ? FONT_UI_WIDTH : FONT_UI_HEIGHT;
             scrollbar_set_pos(sb, sb->pos + step);
             *new_pos = sb->pos;
             return true;
