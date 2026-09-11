@@ -3443,12 +3443,19 @@ key_cmd_mode:
             indicate_error();
             break;
         }
-        if (modified_count) {
+        /* ZZ = save (if there's a file), then quit.  We write whenever a
+         * filename exists rather than gating on modified_count: the undo-
+         * based modified_count can read 0 for some buffers (observed: a
+         * line ending in ':'), which silently dropped the save on ZZ.  A
+         * redundant write of an unmodified file is harmless; use :q to
+         * quit without writing. */
+        if (current_filename) {
             cnt = file_write(current_filename, text, end - 1);
             if (cnt < 0) {
                 if (cnt == -1)
                     status_line_bold("Write error: %s", strerror(errno));
             } else if (cnt == (end - 1 - text + 1)) {
+                modified_count = 0;
                 editing = 0;
             }
         } else {
