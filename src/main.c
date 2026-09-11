@@ -820,6 +820,70 @@ void spawn_clock_settings(void) {
     g_video_dirty = true;
 }
 
+/* Typematic key-repeat tuning */
+#define KEY_REPEAT_DELAY_MS  400   /* hold time before repeat begins */
+#define KEY_REPEAT_RATE_MS    40   /* interval between repeats (~25/sec) */
+
+/* Deliver a key *press* to the focused window (or the desktop): WM_KEYDOWN
+ * plus WM_CHAR for printable / Cyrillic (UTF-8) characters.  Factored out so
+ * both real presses and synthetic typematic repeats emit identical events.
+ * Release (WM_KEYUP) is handled inline in the input loop — repeats never
+ * emit a release, matching real keyboard make-code behavior. */
+static void deliver_key_press(const key_event_t *kev) {
+    window_event_t we = {0};
+    we.type = WM_KEYDOWN;
+    we.key.scancode = kev->hid_code;
+    we.key.modifiers = 0;
+    if (kev->modifiers & KBD_MOD_SHIFT) we.key.modifiers |= KMOD_SHIFT;
+    if (kev->modifiers & KBD_MOD_CTRL)  we.key.modifiers |= KMOD_CTRL;
+    if (kev->modifiers & KBD_MOD_ALT)   we.key.modifiers |= KMOD_ALT;
+
+    /* Route to desktop keyboard handler when no window has focus */
+    if (wm_get_focus() == HWND_NULL && desktop_has_focus()) {
+        desktop_key(we.key.scancode, we.key.modifiers);
+    } else {
+        wm_post_event_focused(&we);
+    }
+
+    /* Send WM_CHAR for printable characters.  Win1251 Cyrillic (0x80+) is
+     * converted to UTF-8 (2 bytes -> 2 WM_CHAR events). */
+    if (kev->ascii >= 0x20 && kev->ascii <= 0x7E) {
+        we.type = WM_CHAR;
+        we.charev.ch = kev->ascii;
+        wm_post_event_focused(&we);
+    } else if (kev->ascii >= 0x80) {
+        /* Convert Win1251 byte to Unicode codepoint, then encode as UTF-8 */
+        uint16_t cp = 0;
+        uint8_t b = kev->ascii;
+        if (b >= 0xC0 && b <= 0xDF) cp = 0x0410 + (b - 0xC0);
+        else if (b >= 0xE0 && b <= 0xFF) cp = 0x0430 + (b - 0xE0);
+        else if (b == 0xA8) cp = 0x0401;
+        else if (b == 0xB8) cp = 0x0451;
+        else if (b == 0xB9) cp = 0x2116;
+        else cp = b;  /* fallback */
+
+        if (cp >= 0x80 && cp < 0x800) {
+            we.type = WM_CHAR;
+            we.charev.ch = (char)(0xC0 | (cp >> 6));
+            wm_post_event_focused(&we);
+            we.charev.ch = (char)(0x80 | (cp & 0x3F));
+            wm_post_event_focused(&we);
+        } else if (cp >= 0x800) {
+            we.type = WM_CHAR;
+            we.charev.ch = (char)(0xE0 | (cp >> 12));
+            wm_post_event_focused(&we);
+            we.charev.ch = (char)(0x80 | ((cp >> 6) & 0x3F));
+            wm_post_event_focused(&we);
+            we.charev.ch = (char)(0x80 | (cp & 0x3F));
+            wm_post_event_focused(&we);
+        } else {
+            we.type = WM_CHAR;
+            we.charev.ch = (char)cp;
+            wm_post_event_focused(&we);
+        }
+    }
+}
+
 static void input_task(void *params) {
     (void)params;
 
@@ -827,6 +891,11 @@ static void input_task(void *params) {
     int16_t cur_x = display_width / 2;
     int16_t cur_y = display_height / 2;
     uint8_t prev_buttons = 0;
+
+    /* Typematic key-repeat state (persists across loop iterations) */
+    key_event_t rep_kev;
+    bool        rep_armed = false;
+    TickType_t  rep_next = 0;
 
     for (;;) {
         /* In fullscreen 8bpp mode, the app owns the display and keyboard.
@@ -1006,68 +1075,39 @@ static void input_task(void *params) {
                 }
             }
 
-            window_event_t we = {0};
             if (kev.pressed) {
-                /* Send WM_KEYDOWN for all key presses */
-                we.type = WM_KEYDOWN;
-                we.key.scancode = kev.hid_code;
-                we.key.modifiers = 0;
-                if (kev.modifiers & KBD_MOD_SHIFT) we.key.modifiers |= KMOD_SHIFT;
-                if (kev.modifiers & KBD_MOD_CTRL)  we.key.modifiers |= KMOD_CTRL;
-                if (kev.modifiers & KBD_MOD_ALT)   we.key.modifiers |= KMOD_ALT;
-
-                /* Route to desktop keyboard handler when no window has focus */
-                if (wm_get_focus() == HWND_NULL && desktop_has_focus()) {
-                    desktop_key(we.key.scancode, we.key.modifiers);
-                } else {
-                    wm_post_event_focused(&we);
-                }
-
-                /* Send WM_CHAR for printable characters.
-                 * Win1251 Cyrillic (0x80+) is converted to UTF-8
-                 * (2 bytes → 2 WM_CHAR events). */
-                if (kev.ascii >= 0x20 && kev.ascii <= 0x7E) {
-                    we.type = WM_CHAR;
-                    we.charev.ch = kev.ascii;
-                    wm_post_event_focused(&we);
-                } else if (kev.ascii >= 0x80) {
-                    /* Convert Win1251 byte to Unicode codepoint,
-                     * then encode as UTF-8 (2 bytes for Cyrillic) */
-                    uint16_t cp = 0;
-                    uint8_t b = kev.ascii;
-                    if (b >= 0xC0 && b <= 0xDF) cp = 0x0410 + (b - 0xC0);
-                    else if (b >= 0xE0 && b <= 0xFF) cp = 0x0430 + (b - 0xE0);
-                    else if (b == 0xA8) cp = 0x0401;
-                    else if (b == 0xB8) cp = 0x0451;
-                    else if (b == 0xB9) cp = 0x2116;
-                    else cp = b;  /* fallback */
-
-                    if (cp >= 0x80 && cp < 0x800) {
-                        we.type = WM_CHAR;
-                        we.charev.ch = (char)(0xC0 | (cp >> 6));
-                        wm_post_event_focused(&we);
-                        we.charev.ch = (char)(0x80 | (cp & 0x3F));
-                        wm_post_event_focused(&we);
-                    } else if (cp >= 0x800) {
-                        we.type = WM_CHAR;
-                        we.charev.ch = (char)(0xE0 | (cp >> 12));
-                        wm_post_event_focused(&we);
-                        we.charev.ch = (char)(0x80 | ((cp >> 6) & 0x3F));
-                        wm_post_event_focused(&we);
-                        we.charev.ch = (char)(0x80 | (cp & 0x3F));
-                        wm_post_event_focused(&we);
-                    } else {
-                        we.type = WM_CHAR;
-                        we.charev.ch = (char)cp;
-                        wm_post_event_focused(&we);
-                    }
+                deliver_key_press(&kev);
+                /* Arm typematic repeat for this key (skip pure modifiers,
+                 * HID 0xE0..0xE7 — Ctrl/Shift/Alt/GUI shouldn't self-repeat).
+                 * A new key replaces whatever was repeating. */
+                if (kev.hid_code < 0xE0 || kev.hid_code > 0xE7) {
+                    rep_kev = kev;
+                    rep_armed = true;
+                    rep_next = xTaskGetTickCount() +
+                               pdMS_TO_TICKS(KEY_REPEAT_DELAY_MS);
                 }
             } else {
+                window_event_t we = {0};
                 we.type = WM_KEYUP;
                 we.key.scancode = kev.hid_code;
                 wm_post_event_focused(&we);
+                /* Stop repeating when the repeating key is released */
+                if (rep_armed && kev.hid_code == rep_kev.hid_code)
+                    rep_armed = false;
             }
             g_video_dirty = true;
+        }
+
+        /* Typematic repeat: while a key is held, re-deliver it after the
+         * initial delay, then at the repeat rate.  Ticks off this loop's
+         * ~8 ms cadence.  Signed tick comparison tolerates wraparound. */
+        if (rep_armed) {
+            TickType_t now = xTaskGetTickCount();
+            if ((int32_t)(now - rep_next) >= 0) {
+                deliver_key_press(&rep_kev);
+                rep_next = now + pdMS_TO_TICKS(KEY_REPEAT_RATE_MS);
+                g_video_dirty = true;
+            }
         }
 
         /* Poll mouse — merge PS/2 and USB HID sources */
