@@ -525,14 +525,16 @@ extern const uint8_t *clock_icon16_get(void);
 
 static void execute_sub_item(int index) {
     startmenu_close_for_action();
-    cursor_set_type(CURSOR_WAIT);
-    /* Let the COMPOSITOR task render the hourglass frame: calling
-     * wm_composite() directly from the input task raced the concurrent
-     * compositor cycle (ghost menus left behind ~50% of launches). */
-    wm_mark_dirty();
-    vTaskDelay(3);
     extern const uint8_t default_icon_16x16[256];
     if (index < fos_app_count) {
+        /* An ELF app can take seconds to load.  Show the hourglass and DEFER
+         * the load (app_launch_deferred): the compositor draws the hourglass /
+         * closed-menu frame first, then blocks on the load — instead of the
+         * old synchronous launch, which froze on the stale menu frame.  The
+         * cursor is restored to the arrow after the load (in the deferred
+         * handler), so do NOT revert it here. */
+        cursor_set_wait_latch(true);   /* hourglass persists across moves */
+        wm_mark_dirty();
         wm_set_pending_icon(fos_apps[index].has_icon
                             ? fos_apps[index].icon : default_icon_16x16);
         /* Look up 32x32 icon from file_assoc registry */
@@ -547,16 +549,17 @@ static void execute_sub_item(int index) {
                 }
             }
         }
-        launch_elf_app(fos_apps[index].path);
-    } else if (index == fos_app_count) {
-        /* FRANK Navigator */
+        app_launch_deferred(fos_apps[index].path, "");
+        return;
+    }
+    if (index == fos_app_count) {
+        /* FRANK Navigator — fast spawn, no load wait. */
         spawn_filemanager_window();
     } else {
-        /* Terminal (last item) */
+        /* Terminal (last item) — fast spawn. */
         wm_set_pending_icon(fn_icon16_terminal_get());
         spawn_terminal_window();
     }
-    cursor_set_type(CURSOR_ARROW);
 }
 
 static void do_flash_firmware(int index) {

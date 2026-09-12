@@ -26,6 +26,7 @@
 #include "dialog.h"
 #include "window.h"
 #include "swap.h"
+#include "cursor.h"
 #include <hardware/watchdog.h>
 
 extern void snd_deinit(void);
@@ -1991,22 +1992,37 @@ void __in_hfa() launch_elf_app_with_files(const char *app_path,
 
 #define APP_DEFERRED_PATH_MAX 256
 
-static volatile bool  app_launch_pending = false;
+/* 0 = none, 1 = armed (draw hourglass frame first), 2 = ready (do the load) */
+static volatile int   app_launch_pending = 0;
 static char           app_launch_app[APP_DEFERRED_PATH_MAX];
 static char           app_launch_file[APP_DEFERRED_PATH_MAX];
 
 void app_launch_deferred(const char *app_path, const char *file_path) {
     strncpy(app_launch_app, app_path, APP_DEFERRED_PATH_MAX - 1);
     app_launch_app[APP_DEFERRED_PATH_MAX - 1] = '\0';
-    strncpy(app_launch_file, file_path, APP_DEFERRED_PATH_MAX - 1);
+    strncpy(app_launch_file, file_path ? file_path : "", APP_DEFERRED_PATH_MAX - 1);
     app_launch_file[APP_DEFERRED_PATH_MAX - 1] = '\0';
-    app_launch_pending = true;
+    app_launch_pending = 1;
 }
 
 void app_launch_check_pending(void) {
-    if (!app_launch_pending) return;
-    app_launch_pending = false;
-    launch_elf_app_with_file(app_launch_app, app_launch_file);
+    if (app_launch_pending == 0) return;
+    if (app_launch_pending == 1) {
+        /* First pass: let the compositor draw the hourglass / closed-menu
+         * frame BEFORE we block on the (possibly multi-second) ELF load.
+         * A synchronous load here freezes the compositor on the stale frame
+         * (menu still up, no hourglass) until the app finishes loading. */
+        app_launch_pending = 2;
+        wm_mark_dirty();
+        return;
+    }
+    app_launch_pending = 0;
+    if (app_launch_file[0])
+        launch_elf_app_with_file(app_launch_app, app_launch_file);
+    else
+        launch_elf_app(app_launch_app);
+    /* Load done and the app window is up — drop the hourglass latch. */
+    cursor_set_wait_latch(false);
 }
 
 // support sygnal for current "sync_ctx" context only for now

@@ -168,10 +168,22 @@ static const cursor_def_t cursors[CURSOR_COUNT] = {
 
 static cursor_type_t current_cursor = CURSOR_ARROW;
 static volatile bool cursor_visible = true;
+/* While held (e.g. an app is loading), the cursor stays the hourglass no
+ * matter what hover-driven requests the WM hit-testing makes. */
+static volatile bool cursor_wait_latch = false;
 
 void cursor_set_type(cursor_type_t type) {
+    if (cursor_wait_latch) {
+        current_cursor = CURSOR_WAIT;   /* keep the hourglass while busy */
+        return;
+    }
     if (type < CURSOR_COUNT)
         current_cursor = type;
+}
+
+void cursor_set_wait_latch(bool on) {
+    cursor_wait_latch = on;
+    current_cursor = on ? CURSOR_WAIT : CURSOR_ARROW;
 }
 
 void cursor_set_visible(bool visible) {

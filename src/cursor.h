@@ -26,6 +26,12 @@ typedef enum {
 /* Set the active cursor shape */
 void cursor_set_type(cursor_type_t type);
 
+/* Latch the hourglass on (true) / off (false).  While latched, cursor_set_type
+ * is overridden so hover-driven WM changes can't revert it — use it around a
+ * blocking/loading operation so the hourglass persists even as the pointer
+ * moves.  Clearing it restores the arrow. */
+void cursor_set_wait_latch(bool on);
+
 /* Get the active cursor shape */
 cursor_type_t cursor_get_type(void);
 
