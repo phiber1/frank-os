@@ -10,6 +10,7 @@
 #include "ico.h"
 #include "window_event.h"
 #include "app.h"
+#include "cursor.h"
 #include "ff.h"
 #include "sdcard_init.h"
 #include <string.h>
@@ -310,6 +311,11 @@ bool file_assoc_open_with(const char *file_path, const char *app_path) {
         }
     }
 
-    launch_elf_app_with_file(app_path, file_path);
+    /* Opening a document can launch a large app (e.g. a .bas -> MMBasic),
+     * which takes real time to load.  Defer the load and latch the hourglass
+     * so it appears immediately and persists across pointer moves, instead of
+     * freezing the caller's task on a stale frame. */
+    cursor_set_wait_latch(true);
+    app_launch_deferred(app_path, file_path);
     return true;
 }
