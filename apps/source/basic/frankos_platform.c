@@ -681,6 +681,11 @@ reset:
         snprintf(runcmd, sizeof(runcmd), "RUN \"%s\"", g_autorun_path);
         g_autorun_path[0] = '\0';  /* consume — only auto-run once */
         strcpy((char *)inpbuf, runcmd);
+        /* Autorun bypasses EditInputLine(), which is where an interactively
+         * submitted RUN hides the console cursor.  Hide it here so an
+         * autorun'd graphics program (e.g. a game) doesn't leave a blinking
+         * text cursor over its display.  INPUT re-shows it as usual. */
+        ShowCursor(0);
         tokenise(true);
         if (setjmp(jmprun) != 0) {
             PrepareProgram(false);
