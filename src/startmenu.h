@@ -20,6 +20,7 @@ void startmenu_toggle(void);
 
 /* Close the start menu */
 void startmenu_close(void);
+void startmenu_close_for_action(void);
 
 /* Is the start menu currently open? */
 bool startmenu_is_open(void);

@@ -1874,6 +1874,12 @@ void __in_hfa() launch_elf_app(const char *path) {
 
     /* Suspend current foreground app before launching new one */
     swap_switch_to(HWND_NULL);
+    /* Launching changes the whole scene (foreground suspended, new window
+     * incoming).  Force a full desktop repaint so any menu/overlay remnants
+     * are cleared and the cursor overlay's save-under is refreshed (otherwise
+     * the hourglass can leave a stale bg-colored box).  Flicker-free via the
+     * PSRAM shadow. */
+    wm_force_full_repaint();
 
     cmd_ctx_t *ctx = get_cmd_startup_ctx();
     /* Set up a fresh context for this ELF */
@@ -1906,6 +1912,12 @@ void __in_hfa() launch_elf_app_with_file(const char *app_path,
                                           const char *file_path) {
     swap_cancel_deferred();
     swap_switch_to(HWND_NULL);
+    /* Launching changes the whole scene (foreground suspended, new window
+     * incoming).  Force a full desktop repaint so any menu/overlay remnants
+     * are cleared and the cursor overlay's save-under is refreshed (otherwise
+     * the hourglass can leave a stale bg-colored box).  Flicker-free via the
+     * PSRAM shadow. */
+    wm_force_full_repaint();
 
     cmd_ctx_t *ctx = get_cmd_startup_ctx();
     if (ctx->orig_cmd) vPortFree(ctx->orig_cmd);
@@ -1937,6 +1949,12 @@ void __in_hfa() launch_elf_app_with_files(const char *app_path,
                                           const char **files, int file_count) {
     swap_cancel_deferred();
     swap_switch_to(HWND_NULL);
+    /* Launching changes the whole scene (foreground suspended, new window
+     * incoming).  Force a full desktop repaint so any menu/overlay remnants
+     * are cleared and the cursor overlay's save-under is refreshed (otherwise
+     * the hourglass can leave a stale bg-colored box).  Flicker-free via the
+     * PSRAM shadow. */
+    wm_force_full_repaint();
 
     cmd_ctx_t *ctx = get_cmd_startup_ctx();
     if (ctx->orig_cmd) vPortFree(ctx->orig_cmd);

@@ -268,6 +268,10 @@ static int      sm_main_su_cap = 0;
 static int16_t  sm_main_x, sm_main_y, sm_main_w, sm_main_h;
 static bool     sm_main_valid = false;
 static volatile bool sm_restore_pending = false;
+/* Closed for an action that forces a full repaint: the compositor must
+ * discard (free + invalidate) the save-under buffers WITHOUT restoring them,
+ * so they aren't reused with stale coords on the next open. */
+static volatile bool sm_discard_pending = false;
 
 /* Programs submenu state */
 static bool   sub_open = false;
@@ -447,7 +451,7 @@ void startmenu_toggle(void) {
     }
 }
 
-void startmenu_close(void) {
+static void startmenu_close_impl(bool restore) {
     if (!sm_open) return;   /* already closed — avoid redundant repaint */
     sm_open = false;
     sub_open = false;
@@ -460,10 +464,33 @@ void startmenu_close(void) {
     set_hover = -1;
     sm_ctx_hover = -1;
     sm_ctx_app_idx = -1;
-    /* Defer pixel restoration to the compositor (startmenu_draw):
-     * this runs on the input task and must not touch the framebuffer. */
-    sm_restore_pending = true;
-    wm_mark_dirty();
+    if (restore) {
+        /* Plain dismiss: erase via save-under (no full-screen repaint).
+         * Deferred to the compositor (startmenu_draw) — this runs on the
+         * input task and must not touch the framebuffer. */
+        sm_restore_pending = true;
+        wm_mark_dirty();
+    } else {
+        /* Closing to launch/act: the scene underneath is about to change,
+         * so the save-under would restore stale pixels.  Skip it and force a
+         * full repaint (flicker-free via the PSRAM shadow).  The compositor
+         * still needs to discard the save-under bookkeeping so it isn't
+         * reused with stale coords on the next open. */
+        sm_restore_pending = false;
+        sm_discard_pending = true;
+        wm_force_full_repaint();
+    }
+}
+
+void startmenu_close(void) {
+    startmenu_close_impl(true);
+}
+
+/* Close the menu when an action will change the screen underneath it
+ * (launching an app, opening a dialog): forces a full repaint instead of the
+ * save-under restore, so no menu remnants linger over the new content. */
+void startmenu_close_for_action(void) {
+    startmenu_close_impl(false);
 }
 
 bool startmenu_is_open(void) {
@@ -497,7 +524,7 @@ extern const uint8_t *net_icon16_connect_get(void);
 extern const uint8_t *clock_icon16_get(void);
 
 static void execute_sub_item(int index) {
-    startmenu_close();
+    startmenu_close_for_action();
     cursor_set_type(CURSOR_WAIT);
     /* Let the COMPOSITOR task render the hourglass frame: calling
      * wm_composite() directly from the input task raced the concurrent
@@ -554,7 +581,7 @@ static void do_flash_firmware(int index) {
 
 static void execute_fw_item(int index) {
     if (index < 0 || index >= uf2_file_count) return;
-    startmenu_close();
+    startmenu_close_for_action();
 
     /* Build confirmation dialog text */
     snprintf(pending_fw_text, sizeof(pending_fw_text),
@@ -568,7 +595,7 @@ static void execute_fw_item(int index) {
 }
 
 static void execute_item(uint8_t id) {
-    startmenu_close();
+    startmenu_close_for_action();
     switch (id) {
     case SM_ID_TERMINAL:
         spawn_terminal_window();
@@ -726,6 +753,20 @@ void startmenu_draw(void) {
                 /* No main save-under (alloc failed) — fall back */
                 wm_force_full_repaint();
             }
+            if (sm_su_buf)     { psram_free(sm_su_buf);     sm_su_buf = NULL;     sm_su_cap = 0; }
+            if (sm_ctx_su_buf) { psram_free(sm_ctx_su_buf); sm_ctx_su_buf = NULL; sm_ctx_su_cap = 0; }
+            if (sm_main_su_buf){ psram_free(sm_main_su_buf); sm_main_su_buf = NULL; sm_main_su_cap = 0; }
+            taskbar_force_dirty();
+        } else if (sm_discard_pending) {
+            /* Closed for an action (full repaint forced): free and invalidate
+             * the save-unders WITHOUT restoring — a restore would paint stale
+             * pixels over the repaint, and leaving them valid corrupts the
+             * next open (stale coords → e.g. a bg-colored cut-out). */
+            sm_discard_pending = false;
+            sm_ctx_su_valid = false;
+            sm_su_valid = false;
+            sm_su_which = 0;
+            sm_main_valid = false;
             if (sm_su_buf)     { psram_free(sm_su_buf);     sm_su_buf = NULL;     sm_su_cap = 0; }
             if (sm_ctx_su_buf) { psram_free(sm_ctx_su_buf); sm_ctx_su_buf = NULL; sm_ctx_su_cap = 0; }
             if (sm_main_su_buf){ psram_free(sm_main_su_buf); sm_main_su_buf = NULL; sm_main_su_cap = 0; }
