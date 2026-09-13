@@ -444,6 +444,7 @@ void printLine(int ln);
 void printScreen(void);
 void SCursor(int x, int y);
 int editInsertChar(unsigned char c, char *multi, int edit_buff_size);
+extern int basic_paste_active(void);   /* frankos_main.c — bracketed paste */
 void PrintFunctKeys(int);
 void PrintStatus(void);
 void SaveToProgMemory(void);
@@ -1005,8 +1006,9 @@ void FullScreenEditor(int xx, int yy, char *fname, int edit_buff_size, bool cmdf
                             i++; // potential space at the start
                     if (tp == EdBuff && *tp == ' ')
                         i++; // correct for a counting error at the start of the buffer
-                    if (buf[1] != 0)
-                        i = 0; // do not insert spaces if buffer too small or has something in it
+                    if (buf[1] != 0 || basic_paste_active())
+                        i = 0; // no auto-indent: typeahead queued, or a paste is
+                               // in progress (pasted text carries its own indent)
                     else
                         buf[i + 1] = 0; // make sure that the end of the buffer is zeroed
                     while (i)

@@ -120,6 +120,13 @@ extern void               basic_run_interpreter(void);
  * Keyboard ring buffer
  * ═════════════════════════════════════════════════════════════════════════ */
 
+/* Bracketed-paste counter: number of pasted bytes still queued in the ring.
+ * While > 0 the editor suppresses its auto-indent (see basic_paste_active),
+ * so pre-indented pasted text isn't re-indented line after line. */
+static volatile int g_paste_remaining = 0;
+
+int basic_paste_active(void) { return g_paste_remaining > 0; }
+
 /* Push one byte into ring buffer and wake BASIC task. */
 void basic_kbuf_push(int c)
 {
@@ -140,6 +147,7 @@ int basic_kbuf_pop(void)
         return -1;
     int c = g_kbuf[g_kbuf_tail];
     g_kbuf_tail = (g_kbuf_tail + 1) % KBUF_SZ;
+    if (g_paste_remaining > 0) g_paste_remaining--;
     return c;
 }
 
@@ -935,6 +943,38 @@ static void push_vt(const char *s)
         basic_kbuf_push((unsigned char)*s++);
 }
 
+/* System clipboard read — sys_table slot 452 (clipboard_get_text).  Used via
+ * direct index because the clipboard API isn't in m-os-api.h (the loader
+ * rejects undefined symbols, so OS services are reached through the table). */
+static const char *clipboard_text(void)
+{
+    static void * const * const _st = (void * const *)0x10FFF000UL;
+    typedef const char *(*fn)(void);
+    return ((fn)_st[452])();
+}
+
+/* Paste the clipboard into the keyboard buffer as if typed.  Newlines are
+ * normalized to CR (MMBasic's Enter), collapsing CRLF, so pasted multi-line
+ * code/commands are accepted at the prompt, in INPUT, and in the editor. */
+static void basic_paste_clipboard(void)
+{
+    const char *s = clipboard_text();
+    if (!s) return;
+    while (*s) {
+        char c = *s++;
+        int pc = -1;
+        if (c == '\r') { pc = '\r'; if (*s == '\n') s++; }
+        else if (c == '\n') pc = '\r';
+        else if ((unsigned char)c >= 0x20 || c == '\t') pc = (unsigned char)c;
+        if (pc >= 0) {
+            /* Count the byte BEFORE queuing it so a concurrently-reading
+             * interpreter already sees the paste latch on its first pop. */
+            g_paste_remaining++;
+            basic_kbuf_push(pc);
+        }
+    }
+}
+
 static bool basic_event(hwnd_t hwnd, const window_event_t *event)
 {
     (void)hwnd;
@@ -966,6 +1006,11 @@ static bool basic_event(hwnd_t hwnd, const window_event_t *event)
             MMAbort = 1;
             return true;
         }
+        /* Ctrl+Shift chords are app shortcuts (e.g. paste) handled in
+         * WM_KEYDOWN — swallow their WM_CHAR so the control char isn't typed. */
+        if ((event->charev.modifiers & KMOD_CTRL) &&
+            (event->charev.modifiers & KMOD_SHIFT))
+            return true;
         /* Ctrl chords aren't text: the OS also delivers the bare letter
          * of a Ctrl+letter chord through WM_CHAR (Ctrl+C left a stray
          * 'c' at the prompt after a break).  The WM_KEYDOWN handler owns
@@ -988,11 +1033,24 @@ static bool basic_event(hwnd_t hwnd, const window_event_t *event)
         return true;
     }
 
+    /* Right-click pastes the clipboard (matches the Terminal). */
+    if (event->type == WM_RBUTTONDOWN) {
+        basic_paste_clipboard();
+        return true;
+    }
+
     /* WM_KEYDOWN: navigation and function keys only (they have no WM_CHAR). */
     if (event->type == WM_KEYDOWN) {
         uint8_t sc  = event->key.scancode;
         uint8_t mod = event->key.modifiers;
         kd_press(sc, mod);
+
+        /* Ctrl+Shift+V — paste the clipboard.  Ctrl+V without Shift keeps its
+         * MMBasic meaning; Ctrl+C stays break.  HID 'v' = 0x19. */
+        if ((mod & KMOD_CTRL) && (mod & KMOD_SHIFT) && sc == 0x19) {
+            basic_paste_clipboard();
+            return true;
+        }
 
         /* Ctrl+C via raw scan: HID 'c' = 0x06 */
         if ((mod & KMOD_CTRL) && sc == 0x06) {
