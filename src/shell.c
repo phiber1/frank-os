@@ -296,6 +296,13 @@ static void shell_run_elf(terminal_t *t, int argc, char **argv) {
         goto done;
     }
 
+    /* A foreground command now owns the keyboard: it reads via the MOS2 raw
+     * path (mos2_c / scancode handler), so tell the Terminal to stop feeding
+     * its WM cooked-input path.  Clear any stale mos2_c first so the Enter
+     * that launched this command doesn't leak in as phantom input. */
+    t->fg_command = true;
+    t->mos2_c = 0;
+
     /* Main exec loop with COMSPEC-like re-run.
      * When an app chains to another (e.g. mc → mcview via cmd_enter_helper),
      * the inner while loop handles the chain. After the chained app exits,
@@ -352,6 +359,9 @@ static void shell_run_elf(terminal_t *t, int argc, char **argv) {
     }
 
 done:
+    /* Foreground command finished — the shell reads the keyboard again. */
+    t->fg_command = false;
+
     /* Repair context for shell use — like MOS2's vCmdTask does after exec.
      * cleanup_ctx/exec may have zeroed pids->p[1], which must point to the
      * shell's ctx for subsequent MOS2 API calls to work. */

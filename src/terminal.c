@@ -722,6 +722,9 @@ static bool terminal_event(hwnd_t hwnd, const window_event_t *event) {
         if ((event->charev.modifiers & KMOD_CTRL) &&
             (event->charev.modifiers & KMOD_SHIFT))
             return true;
+        /* A foreground command owns the keyboard via the MOS2 raw path; don't
+         * also buffer the key here (double-delivery garbage). */
+        if (t->fg_command) return true;
         terminal_snap_bottom(t);   /* typing jumps to live output */
         terminal_input_push(t, (uint8_t)event->charev.ch);
         return true;
@@ -798,24 +801,28 @@ static bool terminal_event(hwnd_t hwnd, const window_event_t *event) {
 
     case WM_KEYDOWN:
         /* Copy/paste: Ctrl+Shift+C / Ctrl+Shift+V (Ctrl+C stays as interrupt).
-         * HID usage: C = 0x06, V = 0x19. */
+         * Terminal-level — always available.  HID usage: C = 0x06, V = 0x19. */
         if ((event->key.modifiers & KMOD_CTRL) &&
             (event->key.modifiers & KMOD_SHIFT)) {
             if (event->key.scancode == 0x06) { term_copy_selection(t); return true; }
             if (event->key.scancode == 0x19) { term_paste(t);          return true; }
         }
-        /* Scrollback view controls (HID usage codes).  These are consumed by
-         * the host and never reach the client. */
+        /* Alt+Enter: toggle fullscreen — window op, always available. */
+        if (event->key.scancode == 0x28 && (event->key.modifiers & KMOD_ALT)) {
+            wm_toggle_fullscreen(hwnd);
+            return true;
+        }
+        /* A foreground command owns the keyboard (it reads via the MOS2 raw
+         * path).  Consume everything else here so keys aren't also delivered
+         * to the shell's cooked path — the running command gets them, not us
+         * (scrollback, F1-about, Enter/Esc/BS/Tab are Terminal-shell keys). */
+        if (t->fg_command) return true;
+        /* Scrollback view controls (HID usage codes) — shell prompt only. */
         switch (event->key.scancode) {
         case 0x4B: terminal_scroll_view(t, t->rows - 1);  return true; /* PgUp */
         case 0x4E: terminal_scroll_view(t, -(t->rows - 1)); return true; /* PgDn */
         case 0x4A: terminal_scroll_view(t, t->sb_count);  return true; /* Home: top */
         case 0x4D: terminal_scroll_view(t, -t->sb_count); return true; /* End: bottom */
-        }
-        /* Alt+Enter: toggle fullscreen (before Enter→'\n' mapping) */
-        if (event->key.scancode == 0x28 && (event->key.modifiers & KMOD_ALT)) {
-            wm_toggle_fullscreen(hwnd);
-            return true;
         }
         /* F1: about */
         if (event->key.scancode == 0x3A) {

@@ -131,6 +131,12 @@ struct terminal {
     /* Closing flag — set by WM_CLOSE handler, checked by shell task */
     volatile bool          closing;
 
+    /* True while the shell is running a foreground command (exec blocked).
+     * The command reads the keyboard via the MOS2 raw path (mos2_c / scancode
+     * handler), so the Terminal suppresses its own WM cooked-input path
+     * (WM_CHAR -> input_buf) to avoid double-delivering every key. */
+    volatile bool          fg_command;
+
     /* Shell task handle — so terminal_force_close can wake the shell
      * when it's blocked in ulTaskNotifyTake waiting for a child app */
     TaskHandle_t           shell_task;
