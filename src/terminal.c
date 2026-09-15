@@ -203,6 +203,180 @@ static void terminal_snap_bottom(terminal_t *t) {
 }
 
 /*==========================================================================
+ * VT100 / ANSI escape parser (console-host feature)
+ *
+ * Lets full-screen console clients (cmd line editing, mc, mcedit, mcview,
+ * less) drive the grid: cursor addressing, erase, colors, insert/delete.
+ * Ported from pshell_vt100.c.  The state machine + CSI executor live in flash
+ * (the SRAM-resident terminal_putc only dispatches into them), and operate on
+ * the terminal's own textbuf/cursor/colors.
+ *=========================================================================*/
+
+enum { TVT_NORMAL, TVT_ESC, TVT_CSI_PARAM, TVT_CSI_INTER };
+
+/* ANSI color index (0-7) -> CGA palette index used in the attr nibble. */
+static const uint8_t ansi_to_cga[8] = {
+    COLOR_BLACK, COLOR_RED, COLOR_GREEN, COLOR_BROWN,
+    COLOR_BLUE, COLOR_MAGENTA, COLOR_CYAN, COLOR_LIGHT_GRAY
+};
+
+/* Current attribute byte from the SGR state (bold brightens fg; reverse swaps). */
+static uint8_t term_vt_attr(terminal_t *t) {
+    uint8_t fg = t->fg_color, bg = t->bg_color;
+    if (t->vt_bold) fg |= 8;
+    if (t->vt_reverse) { uint8_t tmp = fg; fg = bg; bg = tmp; }
+    return TB_PACK(fg, bg);
+}
+
+/* Execute one completed CSI sequence (ESC[ ... <cmd>). */
+static __attribute__((noinline)) void term_csi_execute(terminal_t *t, char cmd) {
+    int cols = t->cols, rows = t->rows;
+    int p0 = (t->vt_nparam > 0) ? t->vt_params[0] : 0;
+    int p1 = (t->vt_nparam > 1) ? t->vt_params[1] : 0;
+    uint8_t attr;
+
+    if (cmd == 'H' || cmd == 'f') {                 /* CUP — position */
+        int row = (p0 > 0) ? p0 - 1 : 0;
+        int col = (p1 > 0) ? p1 - 1 : 0;
+        if (row >= rows) row = rows - 1;
+        if (col >= cols) col = cols - 1;
+        t->cursor_row = row; t->cursor_col = col;
+    } else if (cmd == 'A') {                         /* CUU */
+        int n = (p0 > 0) ? p0 : 1; t->cursor_row -= n;
+        if (t->cursor_row < 0) t->cursor_row = 0;
+    } else if (cmd == 'B') {                         /* CUD */
+        int n = (p0 > 0) ? p0 : 1; t->cursor_row += n;
+        if (t->cursor_row >= rows) t->cursor_row = rows - 1;
+    } else if (cmd == 'C') {                         /* CUF */
+        int n = (p0 > 0) ? p0 : 1; t->cursor_col += n;
+        if (t->cursor_col >= cols) t->cursor_col = cols - 1;
+    } else if (cmd == 'D') {                         /* CUB */
+        int n = (p0 > 0) ? p0 : 1; t->cursor_col -= n;
+        if (t->cursor_col < 0) t->cursor_col = 0;
+    } else if (cmd == 'J') {                         /* ED — erase display */
+        attr = term_vt_attr(t);
+        int r0 = 0, r1 = rows, c0 = 0, c1 = cols;
+        if (p0 == 0) {                               /* cursor..end */
+            for (int c = t->cursor_col; c < cols; c++)
+                { TB_CHAR(t, t->cursor_row, c) = ' '; TB_ATTR(t, t->cursor_row, c) = attr; }
+            r0 = t->cursor_row + 1;
+        } else if (p0 == 1) {                        /* start..cursor */
+            for (int c = 0; c <= t->cursor_col && c < cols; c++)
+                { TB_CHAR(t, t->cursor_row, c) = ' '; TB_ATTR(t, t->cursor_row, c) = attr; }
+            r1 = t->cursor_row;
+        }
+        if (p0 == 0 || p0 == 1 || p0 == 2)
+            for (int r = (p0 == 1 ? r0 : (p0 == 0 ? r0 : 0));
+                 r < (p0 == 1 ? r1 : rows); r++)
+                for (int c = c0; c < c1; c++)
+                    { TB_CHAR(t, r, c) = ' '; TB_ATTR(t, r, c) = attr; }
+    } else if (cmd == 'K') {                         /* EL — erase line */
+        attr = term_vt_attr(t);
+        int a = (p0 == 1) ? 0 : (p0 == 2 ? 0 : t->cursor_col);
+        int b = (p0 == 1) ? t->cursor_col + 1 : cols;
+        for (int c = a; c < b && c < cols; c++)
+            { TB_CHAR(t, t->cursor_row, c) = ' '; TB_ATTR(t, t->cursor_row, c) = attr; }
+    } else if (cmd == 'm') {                         /* SGR — colors/attrs */
+        if (t->vt_nparam == 0) {
+            t->fg_color = COLOR_LIGHT_GRAY; t->bg_color = COLOR_BLACK;
+            t->vt_bold = false; t->vt_reverse = false; return;
+        }
+        for (int i = 0; i < t->vt_nparam; i++) {
+            int p = t->vt_params[i];
+            if (p == 0) { t->fg_color = COLOR_LIGHT_GRAY; t->bg_color = COLOR_BLACK;
+                          t->vt_bold = false; t->vt_reverse = false; }
+            else if (p == 1) t->vt_bold = true;
+            else if (p == 7) t->vt_reverse = true;
+            else if (p == 22) t->vt_bold = false;
+            else if (p == 27) t->vt_reverse = false;
+            else if (p >= 30 && p <= 37) t->fg_color = ansi_to_cga[p - 30];
+            else if (p >= 40 && p <= 47) t->bg_color = ansi_to_cga[p - 40];
+            else if (p >= 90 && p <= 97) t->fg_color = ansi_to_cga[p - 90] | 8;
+            else if (p >= 100 && p <= 107) t->bg_color = ansi_to_cga[p - 100] | 8;
+        }
+    } else if (cmd == 'n') {                          /* DSR — status report */
+        if (p0 == 6) {
+            char resp[24];
+            int len = snprintf(resp, sizeof(resp), "\033[%d;%dR",
+                               t->cursor_row + 1, t->cursor_col + 1);
+            for (int i = 0; i < len; i++) terminal_input_push(t, (uint8_t)resp[i]);
+        }
+    } else if (cmd == 'L' || cmd == 'M') {            /* IL / DL — insert/delete line */
+        int n = (p0 > 0) ? p0 : 1;
+        if (n > rows) n = rows;
+        int rb = cols * 2;
+        uint8_t *base = t->textbuf + t->cursor_row * rb;
+        int movable = rows - t->cursor_row - n;
+        attr = term_vt_attr(t);
+        if (cmd == 'L') {                             /* insert n blank lines */
+            if (movable > 0) memmove(base + n * rb, base, movable * rb);
+            for (int i = 0; i < n && t->cursor_row + i < rows; i++)
+                for (int c = 0; c < cols; c++)
+                    { TB_CHAR(t, t->cursor_row + i, c) = ' '; TB_ATTR(t, t->cursor_row + i, c) = attr; }
+        } else {                                      /* delete n lines */
+            if (movable > 0) memmove(base, base + n * rb, movable * rb);
+            for (int r = rows - n; r < rows; r++)
+                for (int c = 0; c < cols; c++)
+                    { TB_CHAR(t, r, c) = ' '; TB_ATTR(t, r, c) = attr; }
+        }
+    } else if (cmd == 'P' || cmd == '@') {            /* DCH / ICH — delete/insert char */
+        int n = (p0 > 0) ? p0 : 1;
+        if (n > cols) n = cols;
+        uint8_t *row = t->textbuf + TB_OFF(t, t->cursor_row, 0);
+        int tail = cols - t->cursor_col - n;
+        attr = term_vt_attr(t);
+        if (cmd == 'P') {                             /* delete n chars */
+            if (tail > 0) memmove(row + t->cursor_col * 2,
+                                  row + (t->cursor_col + n) * 2, tail * 2);
+            for (int c = cols - n; c < cols; c++)
+                { TB_CHAR(t, t->cursor_row, c) = ' '; TB_ATTR(t, t->cursor_row, c) = attr; }
+        } else {                                      /* insert n blanks */
+            if (tail > 0) memmove(row + (t->cursor_col + n) * 2,
+                                  row + t->cursor_col * 2, tail * 2);
+            for (int i = 0; i < n && t->cursor_col + i < cols; i++)
+                { TB_CHAR(t, t->cursor_row, t->cursor_col + i) = ' ';
+                  TB_ATTR(t, t->cursor_row, t->cursor_col + i) = attr; }
+        }
+    } else if (cmd == 'h' && t->vt_private) {         /* DECSET */
+        if (p0 == 25) t->vt_cursor_off = false;       /* ?25h show cursor */
+    } else if (cmd == 'l' && t->vt_private) {         /* DECRST */
+        if (p0 == 25) t->vt_cursor_off = true;        /* ?25l hide cursor */
+    }
+}
+
+/* Feed one byte while in an escape sequence (vt_state != TVT_NORMAL). */
+static __attribute__((noinline)) void term_vt_feed(terminal_t *t, uint8_t uc) {
+    if (t->vt_state == TVT_ESC) {
+        if (uc == '[') {
+            t->vt_state = TVT_CSI_PARAM;
+            t->vt_nparam = 0; t->vt_cur_param = 0; t->vt_private = 0;
+            for (int i = 0; i < 8; i++) t->vt_params[i] = 0;
+        } else {
+            t->vt_state = TVT_NORMAL;   /* unsupported ESC x — ignore */
+        }
+        return;
+    }
+    /* TVT_CSI_PARAM / TVT_CSI_INTER */
+    if (uc >= '0' && uc <= '9') {
+        t->vt_cur_param = t->vt_cur_param * 10 + (uc - '0');
+    } else if (uc == ';') {
+        if (t->vt_nparam < 8) t->vt_params[t->vt_nparam++] = t->vt_cur_param;
+        t->vt_cur_param = 0;
+    } else if (uc == '?') {
+        t->vt_private = 1;
+    } else if (t->vt_state == TVT_CSI_PARAM && uc >= 0x20 && uc <= 0x2F) {
+        t->vt_state = TVT_CSI_INTER;    /* intermediate bytes — consume */
+    } else if ((uc >= 'A' && uc <= 'Z') || (uc >= 'a' && uc <= 'z') || uc == '@') {
+        if (t->vt_nparam < 8) t->vt_params[t->vt_nparam++] = t->vt_cur_param;
+        term_csi_execute(t, (char)uc);
+        t->vt_state = TVT_NORMAL;
+        wm_invalidate(t->hwnd);
+    } else if (t->vt_state == TVT_CSI_PARAM) {
+        t->vt_state = TVT_NORMAL;       /* malformed — bail */
+    }
+}
+
+/*==========================================================================
  * Text selection + clipboard (console-host feature)
  *
  * Selection is stored in virtual-row coordinates: row 0 is the oldest
@@ -461,7 +635,7 @@ static void __not_in_flash_func(terminal_paint)(hwnd_t hwnd) {
     /* Draw blinking DOS-style underline cursor (bottom 2 scanlines).
      * Hidden while scrolled back into history — the cursor belongs to the
      * live output, which isn't on screen there. */
-    if (t->cursor_visible && t->view_offset == 0 &&
+    if (t->cursor_visible && t->view_offset == 0 && !t->vt_cursor_off &&
         t->cursor_col >= 0 && t->cursor_col < term_cols &&
         t->cursor_row >= 0 && t->cursor_row < term_rows) {
         int cx = ox + t->cursor_col * TERM_FONT_W;
@@ -907,6 +1081,11 @@ void terminal_destroy(terminal_t *t) {
 void __not_in_flash_func(terminal_putc)(terminal_t *t, char c) {
     if (!t || !t->textbuf) return;
 
+    /* Escape-sequence handling: feed bytes to the VT parser (flash helper)
+     * while inside a sequence, and enter one on ESC. */
+    if (t->vt_state != TVT_NORMAL) { term_vt_feed(t, (uint8_t)c); return; }
+    if ((uint8_t)c == 0x1B) { t->vt_state = TVT_ESC; return; }
+
     switch (c) {
     case '\n':
         t->cursor_col = 0;
@@ -919,8 +1098,7 @@ void __not_in_flash_func(terminal_putc)(terminal_t *t, char c) {
         if (t->cursor_col > 0) {
             t->cursor_col--;
             TB_CHAR(t, t->cursor_row, t->cursor_col) = ' ';
-            TB_ATTR(t, t->cursor_row, t->cursor_col) =
-                TB_PACK(t->fg_color, t->bg_color);
+            TB_ATTR(t, t->cursor_row, t->cursor_col) = term_vt_attr(t);
         }
         break;
     case '\t':
@@ -931,6 +1109,7 @@ void __not_in_flash_func(terminal_putc)(terminal_t *t, char c) {
         }
         break;
     default:
+        if ((uint8_t)c < 0x20) break;   /* ignore other control chars */
         if (t->cursor_col >= t->cols) {
             t->cursor_col = 0;
             t->cursor_row++;
@@ -940,8 +1119,7 @@ void __not_in_flash_func(terminal_putc)(terminal_t *t, char c) {
             t->cursor_row = t->rows - 1;
         }
         TB_CHAR(t, t->cursor_row, t->cursor_col) = (uint8_t)c;
-        TB_ATTR(t, t->cursor_row, t->cursor_col) =
-            TB_PACK(t->fg_color, t->bg_color);
+        TB_ATTR(t, t->cursor_row, t->cursor_col) = term_vt_attr(t);
         t->cursor_col++;
         break;
     }

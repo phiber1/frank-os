@@ -91,6 +91,17 @@ struct terminal {
     uint8_t  fg_color, bg_color;
     bool     cursor_visible;
 
+    /* VT100/ANSI escape parser — lets full-screen console clients (cmd line
+     * editing, mc, mcedit, mcview, less) drive the grid with cursor
+     * addressing, erase, colors, insert/delete. */
+    uint8_t  vt_state;         /* TVT_NORMAL/ESC/CSI_PARAM/CSI_INTER */
+    uint8_t  vt_nparam;
+    uint8_t  vt_private;       /* '?' DEC-private prefix seen */
+    bool     vt_bold, vt_reverse;
+    bool     vt_cursor_off;    /* DECRST ?25l hides the cursor */
+    int16_t  vt_cur_param;
+    int16_t  vt_params[8];
+
     /* Text selection (mouse drag → clipboard), in virtual-row coordinates
      * (0 = oldest scrollback line .. sb_count = first live row) so a selection
      * stays anchored to its text as the view scrolls. */
