@@ -408,62 +408,67 @@ static void shell_task(void *pv) {
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/%d", shell_id);
     f_mkdir(tmpdir);
 
-    /* Set default env vars */
+    /* Set default env vars.  COMSPEC = the command processor the Terminal
+     * runs and re-runs (the MOS2 `cmd` shell in /mos2). */
     set_ctx_var(ctx, "CD", "/");
     set_ctx_var(ctx, "BASE", "/");
     set_ctx_var(ctx, "PATH", "/mos2");
     set_ctx_var(ctx, "TEMP", tmpdir);
+    set_ctx_var(ctx, "COMSPEC", "cmd");
 
-    /* Show welcome */
-    terminal_puts(t, "MOS\n");
-    if (sdcard_is_mounted()) {
-        terminal_puts(t, "SD card: mounted\n");
-    } else {
-        terminal_printf(t, "SD card: not mounted (err %d)\n",
-                        (int)sdcard_last_error());
-    }
-    terminal_puts(t, "Type 'help' for commands.\n\n");
+    (void)line; (void)argv;   /* legacy cooked-line reader is retired */
 
+    /* The command processor (cmd) and every command it runs read the keyboard
+     * via the MOS2 raw path (mos2_c / scancode handler); the Terminal never
+     * feeds its own cooked-input path.  Mark the foreground busy for its
+     * whole life so terminal_event suppresses cooked input. */
+    t->fg_command = true;
+
+    /* Command loop — mirrors MOS2's vCmdTask (the correct COMSPEC re-runner),
+     * replacing FRANKOS's hand-rolled chain/COMSPEC repair that corrupted the
+     * ctx across command runs (task #36).  cmd exits to exec a command,
+     * leaving the ctx PREPARED with that command; we run it, and when a
+     * command finishes cleanup_ctx() empties argv — so we rebuild COMSPEC and
+     * re-run cmd.  One rule (rebuild-if-empty) unifies chain + COMSPEC. */
+    const int shell_pid = pid;
     for (;;) {
-        /* Check if terminal is closing */
         if (t->closing) break;
 
-        /* Show prompt with current directory */
-        char *cd = get_ctx_var(ctx, "CD");
-        terminal_printf(t, "%s> ", cd ? cd : "FOS");
-
-        /* Read a line */
-        int len = shell_readline(t, line, sizeof(line));
-        if (len == 0) continue;
-
-        /* Check if terminal is closing */
-        if (t->closing) break;
-
-        /* Parse into argv */
-        int argc = shell_parse(line, argv, SHELL_MAX_ARGS);
-        if (argc == 0) continue;
-
-        /* Check built-in commands */
-        if (strcmp(argv[0], "help") == 0) {
-            cmd_help(argc, argv);
-        } else if (strcmp(argv[0], "clear") == 0 || strcmp(argv[0], "cls") == 0) {
-            cmd_clear(argc, argv);
-        } else if (strcmp(argv[0], "free") == 0) {
-            cmd_free_cmd(argc, argv);
-        } else if (strcmp(argv[0], "ls") == 0 || strcmp(argv[0], "dir") == 0) {
-            cmd_ls(argc, argv);
-        } else if (strcmp(argv[0], "cd") == 0) {
-            cmd_cd(argc, argv);
-        } else if (strcmp(argv[0], "pwd") == 0) {
-            cmd_pwd(argc, argv);
-        } else if (strcmp(argv[0], "mount") == 0) {
-            cmd_mount(argc, argv);
-        } else if (strcmp(argv[0], "reboot") == 0) {
-            cmd_reboot(argc, argv);
-        } else {
-            /* Try to run as ELF from SD card */
-            shell_run_elf(t, argc, argv);
+        if (!ctx->argc && !ctx->argv) {
+            char *comspec = get_ctx_var(ctx, "COMSPEC");
+            const char *cs = comspec ? comspec : "cmd";
+            ctx->argc = 1;
+            ctx->argv = (char **)pvPortCalloc(2, sizeof(char *));
+            ctx->argv[0] = copy_str(cs);
+            if (ctx->orig_cmd) vPortFree(ctx->orig_cmd);
+            ctx->orig_cmd = copy_str(cs);
         }
+        ctx->term = t;
+
+        if (exists(ctx) && is_new_app(ctx) && load_app(ctx)) {
+            exec(ctx);   /* runs cmd or the prepared command; handles chains */
+        } else {
+            terminal_printf(t, "Cannot execute '%s'\n",
+                            ctx->orig_cmd ? ctx->orig_cmd : "?");
+            ctx->stage = INVALIDATED;
+            if (ctx->stage != PREPARED) cleanup_ctx(ctx);
+        }
+
+        if (t->closing) break;
+
+        /* Restore the shell ctx after a command: cleanup_ctx()->__free_ctx()
+         * zeroes ctx->pid and nulls pids->p[pid].  Re-fix them from the SAVED
+         * pid — the old bug used the already-zeroed ctx->pid, writing
+         * pids->p[0] and corrupting process bookkeeping. */
+        ctx->pid  = shell_pid;
+        ctx->pgid = shell_pid;
+        ctx->sid  = shell_pid;
+        ctx->ppid = 0;
+        ctx->task = th;
+        ctx->term = t;
+        vTaskSetThreadLocalStoragePointer(th, 0, ctx);
+        if (pids && (size_t)shell_pid < pids->size)
+            pids->p[shell_pid] = ctx;
     }
 
     /* Shell exiting — clean up per-shell temp directory and destroy terminal */

@@ -812,23 +812,20 @@ static bool terminal_event(hwnd_t hwnd, const window_event_t *event) {
             wm_toggle_fullscreen(hwnd);
             return true;
         }
-        /* A foreground command owns the keyboard (it reads via the MOS2 raw
-         * path).  Consume everything else here so keys aren't also delivered
-         * to the shell's cooked path — the running command gets them, not us
-         * (scrollback, F1-about, Enter/Esc/BS/Tab are Terminal-shell keys). */
+        /* Terminal scrollback: Shift+PgUp/PgDn/Home/End — always available.
+         * Plain PgUp/PgDn/Home/End fall through to the foreground command. */
+        if (event->key.modifiers & KMOD_SHIFT) {
+            switch (event->key.scancode) {
+            case 0x4B: terminal_scroll_view(t, t->rows - 1);   return true; /* Shift+PgUp */
+            case 0x4E: terminal_scroll_view(t, -(t->rows - 1)); return true; /* Shift+PgDn */
+            case 0x4A: terminal_scroll_view(t, t->sb_count);   return true; /* Shift+Home */
+            case 0x4D: terminal_scroll_view(t, -t->sb_count);  return true; /* Shift+End */
+            }
+        }
+        /* The foreground command (cmd or its child) owns the keyboard via the
+         * MOS2 raw path — consume the rest here so it isn't double-delivered. */
         if (t->fg_command) return true;
-        /* Scrollback view controls (HID usage codes) — shell prompt only. */
-        switch (event->key.scancode) {
-        case 0x4B: terminal_scroll_view(t, t->rows - 1);  return true; /* PgUp */
-        case 0x4E: terminal_scroll_view(t, -(t->rows - 1)); return true; /* PgDn */
-        case 0x4A: terminal_scroll_view(t, t->sb_count);  return true; /* Home: top */
-        case 0x4D: terminal_scroll_view(t, -t->sb_count); return true; /* End: bottom */
-        }
-        /* F1: about */
-        if (event->key.scancode == 0x3A) {
-            window_event_t ce = {0}; ce.type = WM_COMMAND; ce.command.id = TCMD_HELP_ABOUT;
-            wm_post_event(hwnd, &ce); return true;
-        }
+        /* Legacy cooked path (unreached while cmd is the command processor). */
         switch (event->key.scancode) {
         case 0x28: terminal_snap_bottom(t); terminal_input_push(t, '\n');  return true;
         case 0x29: terminal_snap_bottom(t); terminal_input_push(t, 0x1B);  return true;
