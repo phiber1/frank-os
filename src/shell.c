@@ -22,6 +22,15 @@
 #define SHELL_MAX_LINE  256
 #define SHELL_MAX_ARGS  16
 
+/* Minimum free SRAM heap needed to LOAD the command processor's code image
+ * (load_app places code + relocated sections in SRAM) and set up its ctx.
+ * The task stack itself now comes from PSRAM when SRAM is tight, so this is the
+ * only SRAM floor left.  cmd's code image is small — it has been observed to
+ * load at ~8 KB free — so this backstop is set low; it only trips on genuine
+ * SRAM exhaustion, where the shell waits for another window to close rather
+ * than spin-relaunching cmd into a load-failure loop (#38). */
+#define SHELL_CMD_LOAD_MIN_HEAP  (6 * 1024)
+
 static int next_shell_id = 0;
 
 /* Recursively remove a directory and all its contents (FatFS) */
@@ -374,6 +383,16 @@ done:
  * Shell task — main loop
  *=========================================================================*/
 
+/* Direct serial heap log (#38 leak diagnostic) — bypasses shell.c's possibly
+ * remapped printf by calling the SDK serial printf via the sys_table. */
+static void shell_heaplog(const char *tag) {
+    static void * const * const _st = (void * const *)0x10FFF000UL;
+    typedef void (*fn)(const char *, ...);
+    ((fn)_st[438])("[HEAP] shell %s: free=%u stackHWM=%u words\n", tag,
+                   (unsigned)xPortGetFreeHeapSize(),
+                   (unsigned)uxTaskGetStackHighWaterMark(NULL));
+}
+
 static void shell_task(void *pv) {
     terminal_t *t = (terminal_t *)pv;
     char line[SHELL_MAX_LINE];
@@ -424,6 +443,8 @@ static void shell_task(void *pv) {
      * whole life so terminal_event suppresses cooked input. */
     t->fg_command = true;
 
+    shell_heaplog("start");   /* #38 diagnostic */
+
     /* Command loop — mirrors MOS2's vCmdTask (the correct COMSPEC re-runner),
      * replacing FRANKOS's hand-rolled chain/COMSPEC repair that corrupted the
      * ctx across command runs (task #36).  cmd exits to exec a command,
@@ -432,6 +453,29 @@ static void shell_task(void *pv) {
      * re-run cmd.  One rule (rebuild-if-empty) unifies chain + COMSPEC. */
     const int shell_pid = pid;
     for (;;) {
+        if (t->closing) break;
+
+        /* Anti-spin OOM guard (#38).  The command's task stack now comes from
+         * PSRAM when the shared SRAM stack is busy (create_app_task_psram), so
+         * a foreground command no longer fails for want of a contiguous SRAM
+         * stack.  The one remaining SRAM constraint is loading cmd's code image
+         * (load_app places it in SRAM): if the SRAM heap is too exhausted even
+         * for that, load_app/exec would fail and we'd tight-loop relaunching
+         * cmd forever.  So when free SRAM is below what cmd needs to load, WAIT
+         * — closing another window frees it — instead of spinning.  Self-heals;
+         * bails immediately if this window closes. */
+        if (xPortGetFreeHeapSize() < SHELL_CMD_LOAD_MIN_HEAP) {
+            bool warned = false;
+            while (!t->closing &&
+                   xPortGetFreeHeapSize() < SHELL_CMD_LOAD_MIN_HEAP) {
+                if (!warned) {
+                    terminal_printf(t, "\r\nLow memory - waiting for resources "
+                                       "(close another window to continue)...\r\n");
+                    warned = true;
+                }
+                vTaskDelay(pdMS_TO_TICKS(250));
+            }
+        }
         if (t->closing) break;
 
         if (!ctx->argc && !ctx->argv) {
@@ -472,10 +516,12 @@ static void shell_task(void *pv) {
     }
 
     /* Shell exiting — clean up per-shell temp directory and destroy terminal */
+    shell_heaplog("exit begin");   /* #38 diagnostic */
     rm_rf(tmpdir);
     terminal_destroy(t);
     /* Free the shell's cmd_ctx_t (env vars, pids entry, struct itself) */
     remove_ctx(ctx);
+    shell_heaplog("exit done");    /* #38 diagnostic */
     vTaskDelete(NULL);
 }
 
@@ -485,7 +531,15 @@ static void shell_task(void *pv) {
 
 bool shell_start(terminal_t *term) {
     TaskHandle_t h = NULL;
-    BaseType_t rc = xTaskCreate(shell_task, "shell", 4096, (void *)term, 1, &h);
+    /* 1024 words (4 KB).  The shell task no longer runs commands on its own
+     * stack — exec() spawns each child on a separate task — so this only covers
+     * the COMSPEC loop, load_app() ELF relocation, rm_rf() and teardown.  The
+     * measured peak (uxTaskGetStackHighWaterMark after loading cmd + mc, running
+     * rm_rf, and terminal teardown) is just ~280 words / 1.1 KB, so 4 KB leaves
+     * ~2.6x headroom; the stack-overflow hook catches any surprise.  Was 4096
+     * (16 KB) then 3072 (12 KB) — 8-12 KB of scarce heap wasted per Terminal
+     * (#38).  This is the single biggest per-Terminal SRAM saving. */
+    BaseType_t rc = xTaskCreate(shell_task, "shell", 1024, (void *)term, 1, &h);
     if (rc == pdPASS && h != NULL) {
         term->shell_task = h;
         return true;

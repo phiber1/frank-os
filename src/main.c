@@ -710,6 +710,25 @@ static void compositor_task(void *params) {
  * Spawn a new terminal window with its own shell task
  *=========================================================================*/
 void spawn_terminal_window(void) {
+    printf("[HEAP] terminal spawn: free=%u bytes\n",
+           (unsigned)xPortGetFreeHeapSize());   /* #38 leak diagnostic */
+
+    /* Pre-flight heap guard (#38): a working Terminal needs to reach a running
+     * cmd — spawn→shell-start costs ~18 KB (12 KB shell stack + terminal/window)
+     * and cmd then needs ~12 KB of working room or it hangs with a blank cursor.
+     * If we can't guarantee that, decline up front rather than create a doomed,
+     * unreclaimable Terminal that hangs and strands its memory. */
+    #define TERMINAL_SPAWN_MIN_HEAP (34 * 1024)
+    if (xPortGetFreeHeapSize() < TERMINAL_SPAWN_MIN_HEAP) {
+        printf("spawn_terminal_window: low heap (%u), declining\n",
+               (unsigned)xPortGetFreeHeapSize());
+        dialog_show(HWND_NULL, "Terminal",
+                    "Not enough memory to open another Terminal.\n"
+                    "Close a window and try again.",
+                    DLG_ICON_WARNING, DLG_BTN_OK);
+        return;
+    }
+
     extern const uint8_t default_icon_16x16[256];
     wm_set_pending_icon(default_icon_16x16);
     hwnd_t hwnd = terminal_create();

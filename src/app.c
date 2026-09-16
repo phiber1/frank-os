@@ -1450,10 +1450,16 @@ typedef struct {
     StaticTask_t tcb;
 } app_tcb_mem_t;
 
+/* Create an app task.  *out_mem receives the static mem block to free later
+ * (NULL if FreeRTOS owns a dynamically-created task).  *out_used_shared (may be
+ * NULL) is set true ONLY when the task took the shared SRAM stack, so the
+ * caller knows whether a matching swap_stack_release() is owed — a PSRAM or
+ * dynamic-SRAM stack owes none, even though *out_mem is non-NULL for PSRAM. */
 static TaskHandle_t create_app_task_psram(
     TaskFunction_t fn, const char* name, void* param,
-    UBaseType_t priority, void** out_mem, bool background)
+    UBaseType_t priority, void** out_mem, bool background, bool* out_used_shared)
 {
+    if (out_used_shared) *out_used_shared = false;
     if (background) {
         /* Background app: both TCB and stack in PSRAM (old behavior) */
         app_task_mem_bg_t* mem = NULL;
@@ -1481,6 +1487,7 @@ static TaskHandle_t create_app_task_psram(
         }
         if (mem) {
             *out_mem = mem;
+            if (out_used_shared) *out_used_shared = true;
             swap_stack_acquire();
             /* Re-fill shared stack with watermark before each new task */
             StackType_t *ss = swap_get_shared_stack();
@@ -1491,11 +1498,41 @@ static TaskHandle_t create_app_task_psram(
                                      ss, &mem->tcb);
         }
     }
-    /* Allocation failed — fall back to dynamic SRAM allocation */
+    /* Shared stack busy (or TCB alloc failed).  Prefer a dynamic SRAM stack
+     * (fast), but if the SRAM heap can't supply a contiguous 8 KB block, fall
+     * back to a PSRAM stack (7 MB free) so a foreground command never OOM-hangs
+     * under memory pressure (#38).  A PSRAM stack owes no swap_stack_release. */
     *out_mem = NULL;
-    TaskHandle_t h;
-    xTaskCreate(fn, name, 2048, param, priority, &h);
-    return h;
+
+    /* Shared SRAM stack is busy (another Terminal's foreground app holds it).
+     * For the attached foreground path (out_used_shared tracked), PREFER a
+     * PSRAM stack over a dynamic SRAM one: it keeps every secondary Terminal's
+     * cmd (and the commands it runs) out of the scarce ~60 KB SRAM heap, which
+     * is what lets several Terminals coexist and run commands (#38).  The
+     * primary Terminal still gets the fast shared SRAM stack; only secondaries
+     * pay the PSRAM tax.  Cleanup keys swap_stack_release() on the used_shared
+     * flag, so this non-NULL *out_mem (not the shared stack) is freed without a
+     * wrong release.  Detached/background callers (out_used_shared == NULL) key
+     * release on *out_mem, so they must NOT use PSRAM here — they fall through
+     * to the dynamic-SRAM path below, as before. */
+    if (out_used_shared && psram_is_available()) {
+        app_task_mem_bg_t* pm =
+            (app_task_mem_bg_t*)psram_alloc(sizeof(app_task_mem_bg_t));
+        if (pm) {
+            memset(pm, 0, sizeof(*pm));
+            *out_mem = pm;   /* freed via task_mem_defer_free; no swap release */
+            printf("[stack] '%s' -> PSRAM stack (shared busy)\n", name);
+            return xTaskCreateStatic(fn, name, 2048, param, priority,
+                                     pm->stack, &pm->tcb);
+        }
+    }
+
+    /* Last resort (and the only option for detached/background here): a dynamic
+     * SRAM stack.  FreeRTOS owns stack+TCB and frees them on vTaskDelete. */
+    TaskHandle_t h = NULL;
+    if (xTaskCreate(fn, name, 2048, param, priority, &h) == pdPASS)
+        return h;
+    return NULL;   /* truly out of memory */
 }
 
 static void __in_hfa() vAppDetachedTask(void *pv) {
@@ -1644,7 +1681,8 @@ void __in_hfa() exec(cmd_ctx_t* ctx) { // like init proc flow
             bool bg = (ctxi->pboot_ctx &&
                        (ctxi->pboot_ctx->app_flags & 1));  /* APPFLAG_BACKGROUND */
             TaskHandle_t new_task = create_app_task_psram(
-                vAppDetachedTask, ctxi->argv[0], ctxi, APP_TASK_PRIORITY, &tmem, bg);
+                vAppDetachedTask, ctxi->argv[0], ctxi, APP_TASK_PRIORITY, &tmem, bg,
+                NULL);   /* detached cleanup keys swap release on its own path */
             ctxi->task_mem = tmem;
             /* Mark as pending background so swap_register() picks it up
              * when the app creates its window inside exec_sync(). */
@@ -1665,8 +1703,28 @@ void __in_hfa() exec(cmd_ctx_t* ctx) { // like init proc flow
              * its notification — a post-create drain would eat it. */
             ulTaskNotifyTake(pdTRUE, 0);
             void* tmem;
-            create_app_task_psram(vAppAttachedTask, ctx->argv[0], ctx, APP_TASK_PRIORITY, &tmem, false);
+            bool child_used_shared = false;
+            TaskHandle_t child_task = create_app_task_psram(
+                vAppAttachedTask, ctx->argv[0], ctx, APP_TASK_PRIORITY, &tmem, false,
+                &child_used_shared);
             ctx->task_mem = tmem;
+            if (!child_task) {
+                /* Out of memory: no child task was created, so nothing will
+                 * ever notify us.  Blocking on ulTaskNotifyTake here would
+                 * hang the Terminal forever (#38).  Report, clean up, and
+                 * move on to the next chained command (or return). */
+                goutf("Out of memory\n");
+                if (child_used_shared) swap_stack_release();
+                cleanup_bootb_ctx(ctx);
+                set_usb_detached_handler(0);
+                set_scancode_handler(0);
+                set_cp866_handler(0);
+                kbd_set_stdin_owner(1);
+                if (ctx->stage != PREPARED)
+                    cleanup_ctx(ctx);
+                ctx = pipe_ctx;
+                continue;
+            }
             #if DEBUG_APP_LOAD
             goutf("ctx [%p], ulTaskNotifyTake[%p]\n", ctx, ctx->parent_task);
             #endif
@@ -1683,7 +1741,7 @@ void __in_hfa() exec(cmd_ctx_t* ctx) { // like init proc flow
                     /* Child didn't get to defer-free its own task_mem */
                     if (tmem) task_mem_defer_free(tmem);
                 }
-                if (tmem) swap_stack_release();
+                if (child_used_shared) swap_stack_release();
                 cleanup_bootb_ctx(ctx);
                 set_usb_detached_handler(0);
                 set_scancode_handler(0);
@@ -1693,7 +1751,7 @@ void __in_hfa() exec(cmd_ctx_t* ctx) { // like init proc flow
                 vTaskPrioritySet(NULL, 1);
                 return;
             }
-            if (tmem) swap_stack_release();  /* release only if child used shared stack */
+            if (child_used_shared) swap_stack_release();  /* only the shared stack owes a release */
             deliver_signals(ctx);
             #if DEBUG_APP_LOAD
             goutf("ctx [%p], ulTaskNotifyTake passed\n", ctx);

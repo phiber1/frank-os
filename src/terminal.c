@@ -79,6 +79,12 @@ static void sb_clear(terminal_t *t) {
  * Kept out of SRAM (no __not_in_flash_func) since it touches only SRAM/heap —
  * there's no PSRAM here, so no QMI flash-fetch contention to avoid. */
 static __attribute__((noinline)) void sb_push_row0(terminal_t *t, int cols) {
+    /* Lazily allocate the slot ring on the first scroll-off.  If it can't be
+     * had, scrollback simply stays disabled — the terminal keeps working. */
+    if (!t->sb_slot) {
+        t->sb_slot = (sb_line_t *)pvPortCalloc(t->sb_lines, sizeof(sb_line_t));
+        if (!t->sb_slot) return;
+    }
     volatile uint8_t *r0 = t->textbuf;                 /* row 0 cells */
     int len = cols;
     while (len > 0 && r0[(len - 1) * 2] == ' ') len--; /* trim trailing */
@@ -972,15 +978,16 @@ hwnd_t terminal_create(void) {
         t->textbuf[i * 2 + 1] = attr;
     }
 
-    /* Allocate the scrollback slot ring (small — ~4 KB; line cell buffers are
-     * malloc'd on demand as lines scroll off).  Terminal still works if this
-     * fails; scrollback is just disabled. */
+    /* Scrollback slot ring (~4 KB) is allocated lazily on the first line that
+     * scrolls off the top (sb_push_row0) — most short-lived Terminals (a few
+     * commands, a prompt) never scroll, so this keeps ~4 KB of scarce heap per
+     * Terminal free until it's actually needed (#38). */
     t->sb_lines = SCROLLBACK_LINES;
     t->sb_count = 0;
     t->sb_head = 0;
     t->sb_bytes = 0;
     t->view_offset = 0;
-    t->sb_slot = (sb_line_t *)pvPortCalloc(t->sb_lines, sizeof(sb_line_t));
+    t->sb_slot = NULL;   /* allocated on demand */
     scrollbar_init(&t->vsb, false);
 
     /* Create input semaphore */
